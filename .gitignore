@@ -37,3 +37,6 @@ Thumbs.db
 # Go build artifacts (giữ lại WinMonitor.exe đã build sẵn)
 windows-native/winmonitor
 windows-native/*.test
+
+# Bản mã hóa KHÔNG commit (chứa code đã mã hóa + dùng mật khẩu riêng - issue #1)
+win_monitor_mahoa.pyw

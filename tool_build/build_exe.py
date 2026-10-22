@@ -113,6 +113,18 @@ def main():
     if args.sign:
         do_sign(exe, args.sign, args.pfx, args.pfx_pass, args.thumbprint)
 
+    # Checksum de xac minh toan ven (issue #22)
+    if os.path.exists(exe):
+        import hashlib
+        h = hashlib.sha256()
+        with open(exe, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        sums = os.path.join(os.path.dirname(exe), "SHA256SUMS.txt")
+        with open(sums, "w", encoding="utf-8") as f:
+            f.write("%s  %s\n" % (h.hexdigest(), os.path.basename(exe)))
+        print("SHA256:", h.hexdigest())
+
     print("\n=== XONG ===")
     print("File .exe:", exe)
     print("May CHUA CAI PYTHON chi can chay file nay.")

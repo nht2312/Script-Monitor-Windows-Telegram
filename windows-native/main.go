@@ -293,7 +293,10 @@ type sendItem struct {
 	path    string
 	caption string
 	markup  string // reply_markup JSON (tùy chọn)
+	tries   int
 }
+
+const maxSendTries = 20
 
 type sendQueue struct {
 	mu     sync.Mutex
@@ -464,6 +467,15 @@ func senderLoop() {
 		}
 		okSent := deliver(item, chat)
 		if !okSent {
+			item.tries++
+			if item.tries > maxSendTries {
+				logMsg(fmt.Sprintf("Bỏ tin sau %d lần thử (lỗi mạng kéo dài).", maxSendTries))
+				if item.kind != "text" && item.path != "" {
+					os.Remove(item.path)
+				}
+				backoff = time.Second
+				continue
+			}
 			// lỗi mạng: backoff + đẩy lại để thử tiếp (không mất tin quan trọng)
 			time.Sleep(backoff)
 			if backoff < 60*time.Second {

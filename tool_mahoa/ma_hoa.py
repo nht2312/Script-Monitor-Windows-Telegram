@@ -256,6 +256,7 @@ def main():
                     help="Che do compiled (kho dich nguoc, phai cung phien ban Python)")
     ap.add_argument("--iter", type=int, default=DEFAULT_ITER, help="So vong PBKDF2")
     ap.add_argument("--selftest", action="store_true", help="Chay kiem tra noi bo")
+    ap.add_argument("--force", action="store_true", help="Bo qua canh bao mat khau yeu")
     args = ap.parse_args()
 
     if args.selftest:
@@ -279,6 +280,15 @@ def main():
             sys.stderr.write("Mat khau rong khong duoc phep.\n")
             sys.exit(1)
         password = pw1
+
+    # Canh bao mat khau yeu / mac dinh cong khai (issue #1)
+    weak = {"doi-mat-khau-nay", "doi_mat_khau_nay_123", "matkhau", "password", "123456", "admin"}
+    if len(password) < 8 or password.lower() in weak:
+        sys.stderr.write("CANH BAO: mat khau yeu hoac la mat khau MAC DINH cong khai.\n"
+                         "  -> Ban nen dung mat khau >= 12 ky tu, KHONG trung vi du/README.\n")
+        if not args.force:
+            sys.stderr.write("  (Dung --force de bo qua canh bao nay.)\n")
+            sys.exit(2)
 
     mode = "c" if args.compile else "s"
     out_text = build_encrypted_script(source_bytes, password, mode=mode, iterations=args.iter)
