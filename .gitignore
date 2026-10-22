@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Config / runtime (chứa token & dữ liệu cá nhân - KHÔNG commit)
+config.json
+*.log
+shot_*.png
+_shot.ps1
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
