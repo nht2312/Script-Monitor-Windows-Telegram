@@ -1,290 +1,423 @@
 # WinMonitor — Giám sát toàn bộ máy Windows qua Telegram
 
-Một file script duy nhất (`win_monitor.pyw`) chạy nền, tự khởi động cùng Windows,
-chụp màn hình định kỳ và gửi qua Telegram, đồng thời cho phép điều khiển ngược
-lại từ Telegram (tắt máy, ngắt/kết nối bàn phím–chuột, đổi chu kỳ chụp...).
-Mọi thao tác nguy hiểm đều phải xác nhận bằng **mật khẩu một lần (OTP)**.
+Công cụ giám sát & điều khiển máy Windows từ xa qua **Telegram**: chụp màn hình định kỳ,
+theo dõi cửa sổ/tiến trình/clipboard/keylogger, tắt máy, khóa màn hình, ngắt/kết nối lại
+bàn phím–chuột… Mọi thao tác nguy hiểm đều phải xác nhận bằng **mật khẩu một lần (OTP)**
+gửi qua Telegram. Script **tự khởi động cùng Windows và tự phục hồi** nếu bị tắt.
 
-> Chỉ cần **Python 3** cho Windows. Không cần cài thêm thư viện nào.
-
-## Các file trong repo
-
-| File | Mô tả |
-|---|---|
-| `win_monitor.pyw` | **Script gốc** — toàn bộ code, dùng để đọc/sửa |
-| `win_monitor_mahoa.pyw` | **Bản đã mã hóa** của script gốc — dùng để triển khai (không lộ code/token) |
-| `tool_mahoa/` | Công cụ mã hóa + tài liệu (xem `tool_mahoa/README.md`) |
-| `windows-native/` | ⭐ **Bản Go native `WinMonitor.exe`** — máy đích không cần Python, ít bị AV báo nhầm |
-| `tool_build/` | Công cụ đóng gói bản Python thành `.exe` (PyInstaller) |
-| `.github/workflows/` | CI tự build `.exe` trên GitHub Actions |
-| `.gitignore` | Bỏ qua `config.json`, `.env`, log, ảnh chụp... |
-
-> ❓ **Máy đích chưa cài Python?** Dùng bản **`WinMonitor.exe`** (tự build qua GitHub
-> Actions hoặc `tool_build/`). Xem mục **10. Máy chưa cài Python** ở cuối.
+> Có **2 phiên bản** cùng tính năng:
+> - **Go native (`WinMonitor.exe`)** ⭐ — máy đích **KHÔNG cần Python**, ít bị antivirus báo nhầm. **Khuyến nghị.**
+> - **Python (`win_monitor.pyw`)** — để đọc/sửa code, chạy được mọi Python 3.
 
 ---
 
-## 1. Cài đặt (làm 1 lần)
+## Mục lục
+1. [Cấu trúc repo](#1-cấu-trúc-repo)
+2. [Hai phiên bản: Python vs Go](#2-hai-phiên-bản-python-vs-go)
+3. [Kiến trúc & luồng hoạt động (FLOW)](#3-kiến-trúc--luồng-hoạt-động-flow)
+4. [Luồng xử lý một lệnh Telegram](#4-luồng-xử-lý-một-lệnh-telegram)
+5. [Máy trạng thái: OTP & BlockInput](#5-máy-trạng-thái-otp--blockinput)
+6. [Cài đặt & chạy](#6-cài-đặt--chạy)
+7. [Danh sách lệnh Telegram](#7-danh-sách-lệnh-telegram)
+8. [Cấu hình (và cách sửa)](#8-cấu-hình-và-cách-sửa)
+9. [Cơ chế tự khởi động & tự phục hồi](#9-cơ-chế-tự-khởi-động--tự-phục-hồi)
+10. [Bảo mật & mô hình đe dọa](#10-bảo-mật--mô-hình-đe-dọa)
+11. [Build & phát hành](#11-build--phát-hành)
+12. [Khắc phục sự cố](#12-khắc-phục-sự-cố)
+13. [Kiểm thử](#13-kiểm-thử)
+14. [Mục đích sử dụng & pháp lý](#14-mục-đích-sử-dụng--pháp-lý)
 
-### 1.1. Cài Python 3
-- Tải tại https://www.python.org/downloads/windows/ (bản 3.8+).
-- Khi cài, **tích** ô **"Add python.exe to PATH"**.
+---
 
-### 1.2. Tạo bot Telegram & lấy Chat ID
-1. Mở Telegram, nhắn **@BotFather** → gõ `/newbot` → đặt tên → nhận **BOT TOKEN**
-   (dạng `123456789:AAE...`).
-2. Lấy **Chat ID** của bạn: nhắn cho **@userinfobot** (hoặc **@getidsbot**) → nó trả
-   về `Id: 123456789`.
+## 1. Cấu trúc repo
 
-### 1.3. Điền cấu hình
-Mở `win_monitor.pyw` bằng Notepad, sửa 2 dòng gần đầu file:
-
-```python
-DEFAULT_BOT_TOKEN = "123456789:AAE...token_cua_ban"
-DEFAULT_CHAT_ID   = "123456789"      # chat id cua ban
+```
+.
+├── windows-native/          ⭐ Bản Go native (WinMonitor.exe) — không cần Python
+│   ├── main.go              # Toàn bộ logic (config, telegram, monitors, commands, persistence)
+│   ├── platform_windows.go  # Syscall Win32: GDI screenshot, BlockInput, keyboard hook, ACL...
+│   ├── platform_other.go    # Stub để build/test trên Linux
+│   ├── main_test.go         # Unit test (go test)
+│   ├── build.sh / build.bat # Build amd64 + arm64 + checksum
+│   ├── WinMonitor.exe       # Bản build sẵn (amd64)
+│   └── WinMonitor-arm64.exe # Bản build sẵn (arm64)
+│
+├── win_monitor.pyw          # Bản Python (1 file, không cần thư viện ngoài)
+├── tool_mahoa/              # Mã hoá file .pyw thành bản chạy được (mật khẩu)
+├── tool_build/              # Đóng gói bản Python thành .exe (PyInstaller) + manifest/sign
+├── tests/                   # Test tự động bản Python (unittest)
+├── docs/                    # QA checklist, tài liệu phụ
+├── .github/workflows/       # CI build .exe (Go native + Python)
+├── winmonitor.config.example.json  # Mẫu cấu hình đóng gói cạnh .exe
+├── LICENSE                  # MIT + điều khoản sử dụng hợp pháp
+└── README.md
 ```
 
-> **Cách nhanh hơn (không cần sửa file):** mở CMD và chạy
-> ```
-> pythonw win_monitor.pyw --token 123456789:AAE... --chat 123456789
-> ```
+---
 
-### 1.4. Chạy
-- **Double-click** `win_monitor.pyw` (đuôi `.pyw` nên không hiện cửa sổ đen).
-- Lần đầu chạy, script sẽ:
-  - Tự copy vào `%APPDATA%\WinMonitor\.win_monitor.pyw` (file **ẩn**)
-  - Tự copy vào thư mục **Startup** dưới dạng file **ẩn** (`.win_monitor.pyw`)
-  - Đăng ký **Registry Run** + **2 Scheduled Task** (để tự phục hồi nếu bị tắt)
-- Mở Telegram, nhắn **`/start`** cho bot để bắt đầu.
+## 2. Hai phiên bản: Python vs Go
 
-### 1.5. (Khuyến nghị) Chạy quyền Administrator
-Để tính năng **ngắt bàn phím–chuột** (`BlockInput`) hoạt động ổn định, nên chạy
-script bằng quyền Admin. Có thể chuột phải → *Run as administrator* một lần; các
-lần khởi động sau vẫn tự chạy nền.
+| Tiêu chí | Python (`win_monitor.pyw`) | **Go native (`WinMonitor.exe`)** ⭐ |
+|---|---|---|
+| Máy đích cần Python? | **Có** (hoặc đóng gói PyInstaller) | **KHÔNG** — chạy ngay |
+| Kích thước | ~40KB (script) | ~6MB (đã gồm mọi thứ) |
+| Antivirus báo nhầm | Cao (nếu đóng gói PyInstaller) | **Rất thấp** (PE native, không UPX/packer) |
+| Runtime | Python 3 | Không (static binary) |
+| Chụp màn hình | GDI qua ctypes (+ dự phòng PowerShell) | GDI trực tiếp |
+| Keylogger | Polling `GetAsyncKeyState` | **Low-level hook** (`WH_KEYBOARD_LL`), dự phòng polling |
+| Đa kiến trúc | — | amd64 + arm64 |
+| Dùng khi nào | Muốn đọc/sửa code, máy có Python | **Triển khai thực tế (khuyến nghị)** |
+
+> Hai bản dùng **cùng schema cấu hình**, cùng bộ lệnh Telegram, cùng cơ chế OTP/persistence.
 
 ---
 
-## 2. Danh sách lệnh Telegram
+## 3. Kiến trúc & luồng hoạt động (FLOW)
 
-> 💡 **Menu lệnh tự cập nhật:** mỗi khi script khởi động, nó **tự động đẩy danh sách
-> lệnh lên Telegram** (nút menu ☰ trong khung chat). Bạn không cần nhập tay. Muốn
-> cập nhật lại bất cứ lúc nào, gửi `/reload`. Việc này chạy nền nên **không làm gián
-> đoạn** việc sử dụng ở cả hai phía.
+### 3.1. Sơ đồ tổng quát
+
+```
+                          ┌────────────────────────────┐
+                          │        TELEGRAM BOT         │
+                          │  (chủ máy nhắn lệnh / nhận  │
+                          │   ảnh, cảnh báo, OTP)       │
+                          └────────────▲───────┬────────┘
+                                       │       │  HTTPS (api.telegram.org)
+                            gửi tin/ảnh│       │getUpdates (long-poll 25s)
+                                       │       ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                          WinMonitor (1 tiến trình)                     │
+│                                                                        │
+│  [main] khởi động:                                                    │
+│    hide console → load config → single-instance mutex                 │
+│    → getMe (kiểm token) → start keyboard hook → ensure_persistence    │
+│    → spawn các goroutine/thread:                                       │
+│                                                                        │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────┐ │
+│   │ pollLoop     │  │ senderLoop   │  │screenshotLoop│  │ monitors  │ │
+│   │ (nhận lệnh)  │  │ (gửi queue)  │  │ (định kỳ)    │  │ window/   │ │
+│   └──────┬───────┘  └──────▲───────┘  └──────┬───────┘  │ process/  │ │
+│          │ handleUpdate     │ notify()        │ chụp     │ clipboard/│ │
+│          ▼                  │ (queue)         ▼          │ keylog    │ │
+│   handleCommand ───────────┘            takeScreenshot   └───────────┘ │
+│   (set/block/OTP/...)                     (GDI)                        │
+│                                                                        │
+│   ┌────────────────────┐                                               │
+│   │ selfhealLoop       │  mỗi 5 phút: ensure_persistence + dọn ảnh cũ  │
+│   └────────────────────┘                                               │
+└──────────────────────────────────────────────────────────────────────┘
+        │ ghi file                          │ đăng ký tự khởi động
+        ▼                                   ▼
+ %APPDATA%\WinMonitor\            Registry Run + 2 Scheduled Task
+   config.json (ẩn, ACL)          + shortcut ẩn trong Startup
+   monitor.log, shot_*.png
+```
+
+### 3.2. Trình tự khởi động (startup sequence)
+
+1. **Ẩn console** (`-H windowsgui` / `hideConsole`).
+2. **DPI awareness** — để chụp đúng trên đa màn hình DPI hỗn hợp.
+3. **Nạp cấu hình** theo thứ tự ưu tiên:
+   `%APPDATA%\WinMonitor\config.json` → nếu chưa có thì `winmonitor.config.json` cạnh `.exe`
+   → rồi đè bằng `--config`, `WINMON_TOKEN`, `--token`, `--chat`.
+4. **Single-instance mutex** — nếu đã có bản chạy thì thoát (tránh 2 tiến trình tranh `getUpdates`).
+5. **`getMe`** — kiểm tra token hợp lệ; sai token (401) → dừng; lỗi mạng → vẫn tiếp tục.
+6. **Cài keyboard hook** (Go) để keylogger chính xác.
+7. **`ensure_persistence`** — copy bản thân vào `%APPDATA%` (ẩn), tạo shortcut ẩn trong Startup,
+   đăng ký Registry `Run` + 2 Scheduled Task.
+8. **Spawn các luồng** (xem sơ đồ): sender, screenshot, monitors, heartbeat, selfheal, poll.
+9. Gửi tin "đã khởi động", rồi **chờ tín hiệu thoát** (main block ở `select`/vòng poll).
+
+### 3.3. Vòng đời các luồng
+
+| Luồng | Chu kỳ | Việc làm |
+|---|---|---|
+| `pollLoop` | liên tục (long-poll 25s) | `getUpdates` → `handleUpdate` → `handleCommand` |
+| `senderLoop` | ~1.05s/tin | Lấy từ **queue** → gửi; retry khi lỗi mạng/429 (có backoff, tối đa 20 lần) |
+| `screenshotLoop` | mỗi `screenshot_interval` giây | Chụp → đẩy ảnh vào queue (bỏ qua nếu queue đầy) |
+| `windowMonitor` | 2s | Báo khi tiêu đề cửa sổ foreground đổi |
+| `processMonitor` | 5s | Báo tiến trình mới (giới hạn 15/lần) |
+| `clipboardMonitor` | 3s | Báo khi clipboard đổi (nếu bật) |
+| `keyloggerLoop` | hook/30ms | Gom phím gõ, gửi mỗi `keylog_flush` giây |
+| `heartbeatLoop` | `heartbeat_interval` | Báo "vẫn đang chạy" |
+| `selfhealLoop` | 300s | Đăng ký lại persistence + dọn ảnh tạm cũ |
+
+### 3.4. Luồng dữ liệu gửi tin (send pipeline)
+
+Mọi thứ muốn gửi Telegram đều đi qua **queue có giới hạn** (`notify`/`notifyPhoto`):
+
+```
+notify(text) ─┐
+notifyPhoto() ─┼─► SEND_QUEUE (tối đa ~300) ─► senderLoop ─► tgCall(sendMessage/sendPhoto)
+               │      │ (đầy thì bỏ item CŨ nhất, xoá ảnh cũ)        │
+               │      │                                               ├─ lỗi mạng → backoff rồi thử lại (≤20 lần)
+               └──────┘                                               ├─ 429 → đọc retry_after, ngủ rồi gửi lại
+                                                                       └─ ảnh > 9MB → gửi dạng sendDocument
+```
+
+Vì sao dùng queue: tách **người tạo sự kiện** khỏi **người gửi mạng** → giám sát không bị
+block khi mạng chậm, và tuân thủ giới hạn ~1 tin/giây của Telegram.
+
+---
+
+## 4. Luồng xử lý một lệnh Telegram
+
+```
+Bạn gõ "/shot"
+   │
+   ▼
+Telegram server
+   │ getUpdates (pollLoop) trả về message
+   ▼
+handleUpdate(upd)
+   ├─ nếu là callback_query (bấm nút inline) → answerCallbackQuery + coi data như lệnh
+   └─ lấy chat_id, text
+        │
+        ▼
+   isAuthorized(chat_id)? ── KHÔNG ─► log "Unauthorized", bỏ qua
+        │ CÓ (đúng chat chủ, hoặc auto-bind lần đầu)
+        ▼
+   handleCommand(text, chat_id)
+        ├─ "/shot"  → notify("⏳...") + go doScreenshotSend()
+        ├─ "/set"   → applySet → cfgUpdate (validate clamp) → save_config
+        ├─ "/block" → StartBlock(auto, tối đa 30') ...
+        ├─ "/shutdown" → requestOtp("shutdown") → gửi mã
+        └─ "/confirm <mã>" → nếu khớp & chưa hết hạn → executeAction()
+   │
+   ▼
+notify()/notifyPhoto() → SEND_QUEUE → senderLoop → Telegram → bạn nhận kết quả
+```
+
+**Điểm quan trọng:** mọi kiểm tra quyền (chat_id) diễn ra **trước** khi thực thi lệnh; OTP
+là lớp thứ hai cho thao tác nguy hiểm.
+
+---
+
+## 5. Máy trạng thái: OTP & BlockInput
+
+### 5.1. OTP (mật khẩu một lần)
+
+```
+   /shutdown /restart /stop
+        │
+        ▼
+   requestOtp(action)  → sinh mã 6 số (CSPRNG) → lưu {code, expires = now+120s}
+        │                                         → gửi mã qua Telegram
+        ▼
+   chờ /confirm <mã>
+        ├─ mã SAI  → tăng đếm lỗi; đủ 5 lần → hủy toàn bộ OTP
+        ├─ mã ĐÚNG & còn hạn → executeAction(action)  (tắt máy / khởi động lại / dừng)
+        └─ quá 120s → hết hạn, phải yêu cầu lại
+```
+
+Mã chỉ hiển thị trên Telegram của **chủ máy** → kẻ khác (kể cả AI agent chiếm quyền chat)
+không thể tắt máy/dừng giám sát nếu không có mã.
+
+### 5.2. BlockInput (ngắt bàn phím & chuột)
+
+```
+   /block [phút]
+        │
+        ▼
+   auto = phút (hoặc config; nếu 0/>30 → ép = 30)   ← VAN AN TOÀN CỨNG
+        │
+        ▼
+   StartBlock(auto):  giữ 1 OS thread, gọi BlockInput(TRUE)
+        │              + luôn có defer BlockInput(FALSE)
+        ├─ /unblock  → đóng kênh stop → BlockInput(FALSE)
+        ├─ hết auto phút → tự BlockInput(FALSE) + báo Telegram
+        └─ tiến trình thoát (kể cả /stop) → release trong defer / graceful exit
+```
+
+Van an toàn 30 phút đảm bảo **không bao giờ khóa cứng** máy kể cả khi mất mạng/mất Telegram.
+
+---
+
+## 6. Cài đặt & chạy
+
+### 6.1. Cách A — Go native (khuyến nghị, không cần Python)
+1. Tải `WinMonitor.exe` (trong `windows-native/` hoặc Releases).
+2. Cấu hình (chọn 1):
+   - `WinMonitor.exe --token 123:ABC --chat 987654321`
+   - hoặc đặt `winmonitor.config.json` cạnh `.exe` (xem file `.example`).
+3. Double-click `.exe` → tự cài khởi động ẩn + tự phục hồi.
+4. Telegram → `/start`.
+
+### 6.2. Cách B — Python
+1. Cài Python 3 (tích "Add to PATH").
+2. Tạo bot: **@BotFather** → `/newbot` → lấy token; lấy chat id qua **@userinfobot**.
+3. `pythonw win_monitor.pyw --token ... --chat ...` (hoặc sửa `DEFAULT_BOT_TOKEN`/`DEFAULT_CHAT_ID`).
+4. Telegram → `/start`.
+
+### 6.3. Chạy quyền Administrator (khuyến nghị)
+`/block` (ngắt bàn phím–chuột) cần quyền Admin để chắc chắn hoạt động. Chuột phải → *Run as administrator* một lần.
+
+---
+
+## 7. Danh sách lệnh Telegram
+
+> Menu lệnh (nút ☰) **tự cập nhật** mỗi lần khởi động; gõ `/reload` để cập nhật lại.
 
 ### Giám sát
 | Lệnh | Tác dụng |
 |---|---|
-| `/status` | Xem trạng thái hiện tại |
+| `/status` | Trạng thái (uptime, chụp, monitors, quyền Admin, RDP, hàng đợi…) |
 | `/shot` | Chụp màn hình ngay |
-| `/interval <giây>` | Đổi chu kỳ chụp (vd `/interval 120` = 2 phút) |
+| `/interval <giây>` | Đổi chu kỳ chụp (5–86400) |
 | `/screen on\|off` | Bật/tắt chụp định kỳ |
-| `/activity on\|off` | Báo khi cửa sổ đang dùng thay đổi |
-| `/process on\|off` | Báo khi có tiến trình mới mở |
+| `/activity on\|off` | Báo đổi cửa sổ |
+| `/process on\|off` | Báo tiến trình mới |
 | `/clip on\|off` | Theo dõi clipboard |
-| `/keylog on\|off` | Ghi lại phím gõ (gửi định kỳ) |
+| `/keylog on\|off` | Ghi phím gõ (có cảnh báo quyền riêng tư) |
 
 ### Điều khiển
 | Lệnh | Tác dụng |
 |---|---|
-| `/block [phút]` | **Ngắt bàn phím & chuột** (tự mở lại sau N phút nếu có) |
-| `/unblock` | **Kết nối lại** bàn phím & chuột |
+| `/block [phút]` | Ngắt bàn phím & chuột (tự mở sau tối đa 30 phút) |
+| `/unblock` | Kết nối lại bàn phím & chuột |
 | `/lock` | Khóa màn hình |
 
 ### Nguy hiểm — cần OTP
 | Lệnh | Tác dụng |
 |---|---|
-| `/shutdown` | Tắt máy (gửi OTP xác nhận) |
-| `/restart` | Khởi động lại (gửi OTP xác nhận) |
-| `/stop` | Dừng giám sát & gỡ khỏi khởi động cùng Windows (gửi OTP) |
-| `/confirm <mã>` | Xác nhận mã OTP |
-| `/cancel` | Hủy yêu cầu đang chờ |
+| `/shutdown` | Tắt máy |
+| `/restart` | Khởi động lại |
+| `/stop` | Dừng giám sát & gỡ khỏi khởi động cùng Windows |
+| `/confirm <mã>` | Xác nhận OTP |
+| `/cancel` | Hủy yêu cầu |
 
-### Khác
+### Cấu hình
 | Lệnh | Tác dụng |
 |---|---|
-| `/config` | Xem cấu hình |
-| `/set <khóa> <giá trị>` | Đổi cấu hình trực tiếp |
+| `/config` | Xem toàn bộ (token bị ẩn) |
+| `/get <khóa>` | Xem 1 khóa |
+| `/set <khóa> <giá trị>` | Đổi (tự validate/clamp) |
+| `/reset` | Về mặc định (giữ token/chat_id) |
+| `/reload_config` | Nạp lại từ file (không cần restart) |
 | `/logs [n]` | Xem log gần đây |
-| `/reload` | Cập nhật lại menu lệnh trên Telegram |
+| `/reload` | Cập nhật lại menu lệnh |
 
 ---
 
-## 3. Cơ chế OTP (mật khẩu một lần)
+## 8. Cấu hình (và cách sửa)
 
-Khi bạn gõ `/shutdown`, `/restart` hoặc `/stop`:
-1. Bot gửi một **mã 6 số** dùng **1 lần**, hết hạn sau **120 giây**.
-2. Bạn gõ `/confirm <mã>` để thực thi.
-3. Sai mã hoặc quá hạn → phải yêu cầu lại.
-
-> Vì vậy dù ai đó (kể cả AI agent) có được quyền nhắn bot, **cũng không thể tắt máy
-> hay dừng giám sát** nếu không có mã OTP hiển thị trên Telegram của **chủ máy**.
-
----
-
-## 4. Tự khởi động & tự phục hồi
-
-Script đăng ký nhiều lớp để "không thể tắt":
-- `HKCU\...\Run` → chạy khi đăng nhập.
-- Scheduled Task **WinMonitorLogon** → chạy khi đăng nhập.
-- Scheduled Task **WinMonitorGuard** → chạy **mỗi 1 phút**, tự bật lại nếu bị kill.
-- Bản sao trong thư mục **Startup**.
-
-Chỉ lệnh `/stop` (đã xác thực OTP) mới gỡ bỏ toàn bộ các lớp này.
-
-> Lưu ý: nếu ai đó có quyền Administrator trên máy, họ vẫn có thể gỡ thủ công qua
-> Task Scheduler / Registry. Không có phần mềm nào chống được admin cục bộ tuyệt đối.
-
----
-
-## 5. Cấu hình (file `%APPDATA%\WinMonitor\config.json`)
-
-| Khóa | Mặc định | Ý nghĩa |
+### 8.1. Sửa config — 3 cách
+| Cách | Làm thế nào | Hiệu lực |
 |---|---|---|
-| `screenshot_interval` | `300` | Chu kỳ chụp (giây) |
-| `screenshots_enabled` | `true` | Bật chụp định kỳ |
-| `activity_monitor` | `true` | Báo đổi cửa sổ |
-| `process_monitor` | `true` | Báo tiến trình mới |
-| `clipboard_monitor` | `false` | Theo dõi clipboard |
-| `keylogger` | `false` | Ghi phím gõ |
-| `keylog_flush` | `60` | Giây/lần gửi phím gõ |
-| `block_safety_minutes` | `0` | Tự mở khóa bàn phím/chuột sau N phút (0 = không) |
-| `heartbeat_interval` | `3600` | Giây/lần báo "vẫn đang chạy" |
+| **Telegram** (tiện nhất) | `/set <khóa> <giá trị>`, `/interval`, `/screen on/off`… | **Ngay lập tức**, không cần restart |
+| **File** `%APPDATA%\WinMonitor\config.json` | Sửa trực tiếp | Gõ `/reload_config` (hoặc restart) |
+| **Bootstrap cạnh .exe** `winmonitor.config.json` | Đặt trước khi chạy lần đầu | Chỉ nạp lần đầu, sau đó xoá & chuyển vào `%APPDATA%` |
 
-Đổi bất kỳ giá trị nào qua Telegram bằng `/set <khóa> <giá trị>` — script tự cập nhật
-ngay, không cần khởi động lại.
+### 8.2. Các khóa
+| Khóa | Mặc định | Ý nghĩa | Khoảng |
+|---|---|---|---|
+| `bot_token` | — | Token bot (sửa qua CLI/env/file) | — |
+| `chat_id` | — | Chat ID chủ máy | — |
+| `screenshot_interval` | `300` | Chu kỳ chụp (giây) | 5–86400 |
+| `screenshots_enabled` | `true` | Bật chụp định kỳ | bool |
+| `activity_monitor` | `true` | Báo đổi cửa sổ | bool |
+| `process_monitor` | `true` | Báo tiến trình mới | bool |
+| `clipboard_monitor` | `false` | Theo dõi clipboard | bool |
+| `keylogger` | `false` | Ghi phím gõ | bool |
+| `keylog_flush` | `60` | Giây/lần gửi phím gõ | 10–3600 |
+| `block_safety_minutes` | `0` | Tự mở khóa sau N phút (0 = dùng van 30') | 0–1440 |
+| `heartbeat_interval` | `3600` | Giây/lần báo "vẫn chạy" | 60–86400 hoặc 0 |
+| `allow_autobind` | `true` | Cho tự liên kết chat đầu tiên | bool |
+
+> Giá trị ngoài khoảng sẽ được **tự clamp** (vd `screenshot_interval = 1` → 5).
 
 ---
 
-## 6. Ẩn file & mã hóa script (nâng cao)
+## 9. Cơ chế tự khởi động & tự phục hồi
 
-### 6.1. Tự động ẩn file
-Khi chạy, script tự đặt thuộc tính **Hidden + System** cho:
-- Chính file đang chạy
-- Bản sao `%APPDATA%\WinMonitor\.win_monitor.pyw`
-- Bản sao trong Startup: `.win_monitor.pyw`
+Script đăng ký **nhiều lớp** để khó bị tắt:
+1. **Registry `HKCU\...\Run`** → chạy khi đăng nhập.
+2. **Scheduled Task `WinMonitorLogon`** → chạy khi đăng nhập.
+3. **Scheduled Task `WinMonitorGuard`** → chạy **mỗi 5 phút**, tự bật lại nếu bị kill.
+4. **Shortcut ẩn** trong thư mục Startup.
+5. **`selfhealLoop`** → cứ 5 phút tự đăng ký lại các lớp trên.
 
-Nhờ tên bắt đầu bằng dấu chấm (`.`) và thuộc tính ẩn, file gần như vô hình trong
-File Explorer và giống kiểu file cấu hình `.env`.
+Chỉ lệnh **`/stop`** (đã xác thực OTP) mới gỡ toàn bộ và thoát.
 
-> Để xem lại file ẩn: trong File Explorer bật *View → Show → Hidden items*, hoặc chạy
-> `attrib -h -s "%APPDATA%\WinMonitor\.win_monitor.pyw"` trong CMD.
+> Giới hạn trung thực: người có **quyền Administrator cục bộ** vẫn có thể gỡ thủ công
+> (Task Scheduler, Registry). Không phần mềm nào chống được admin cục bộ tuyệt đối.
 
-### 6.2. Mã hóa script thành `win_monitor_mahoa.pyw`
-Dùng công cụ trong `tool_mahoa/` để tạo bản mã hóa (mở Notepad không thấy code/token,
-nhưng vẫn chạy y như file gốc):
+---
 
+## 10. Bảo mật & mô hình đe dọa
+
+| Lớp | Cơ chế |
+|---|---|
+| Chỉ chủ máy điều khiển | Kiểm tra `chat_id` trước mọi lệnh; có thể tắt auto-bind |
+| Thao tác nguy hiểm | OTP 6 số (CSPRNG), hết hạn 120s, tối đa 5 lần thử |
+| Token | Hỗ trợ `WINMON_TOKEN` (env), che `--token` khỏi argv; config đặt **ẩn + ACL** chỉ user hiện tại |
+| Mã hoá source (tuỳ chọn) | `tool_mahoa/ma_hoa.py` — PBKDF2 + HMAC; từ chối mật khẩu yếu/mặc định |
+| Kênh | HTTPS tới `api.telegram.org` |
+
+**Mô hình đe dọa — điều KHÔNG chống được:**
+- Admin cục bộ đọc bộ nhớ tiến trình lúc giải mã / gỡ Scheduled Task.
+- Ai đọc được `config.json` / biến môi trường token.
+- Đây là công cụ giám sát **máy của chính bạn** — xem mục 14.
+
+---
+
+## 11. Build & phát hành
+
+### Go native (khuyến nghị)
 ```bash
-python tool_mahoa/ma_hoa.py win_monitor.pyw -p "MatKhauCuaBan"
-# -> tạo win_monitor_mahoa.pyw (đã mã hóa)
+cd windows-native && ./build.sh     # Linux/macOS cross-compile → amd64 + arm64 + SHA256SUMS
+# hoặc build.bat trên Windows
+```
+CI `.github/workflows/build-go-exe.yml`: chạy `go test`, build amd64+arm64, checksum, ký số
+(nếu có Secrets), upload artifact & gắn vào Release khi tạo tag `v*`.
+
+### Python → .exe (PyInstaller)
+```bash
+pip install -r tool_build/requirements.txt
+python tool_build/build_exe.py [--onedir] [--sign ...]
+```
+Xem `tool_build/README.md` để chống antivirus báo nhầm (onedir, ký số, FP report…).
+
+### Mã hoá source Python
+```bash
+python tool_mahoa/ma_hoa.py win_monitor.pyw -p "MatKhauManh123"
 ```
 
-Vì file chạy nền từ Startup không có console để hỏi mật khẩu, hãy đặt mật khẩu trong
-file `.env` cạnh script (xem `tool_mahoa/.env.example`):
-
-```
-WINMON_KEY=MatKhauCuaBan
-```
-
-Chi tiết đầy đủ + 2 chế độ (`source`/`compiled`) + cảnh báo bảo mật: xem
-**`tool_mahoa/README.md`**.
+> ⚠️ GitHub Actions cần **billing/Actions** hoạt động (repo private). Nếu CI báo lỗi
+> "spending limit", xem issue #21 — có thể build tay hoặc chuyển repo sang Public.
 
 ---
 
-## 7. Gỡ cài đặt hoàn toàn
-
-1. Gửi `/stop` trên Telegram → nhập `/confirm <mã>` → script tự gỡ khỏi Startup,
-   Registry và Scheduled Task rồi thoát.
-2. (Tùy chọn) Xóa thư mục `%APPDATA%\WinMonitor`.
-
----
-
-## 8. Bảo mật
-
-- **Token** nằm trong file → nên đặt quyền file chỉ user hiện tại đọc được.
-- Chỉ **Chat ID** đã cấu hình mới điều khiển được bot.
-- OTP hiển thị **chỉ trên Telegram của chủ máy** → kẻ khác không tắt được máy.
-- Dùng bản mã hóa `win_monitor_mahoa.pyw` để không lộ code/token khi mở file.
-
----
-
-## 9. Khắc phục sự cố
+## 12. Khắc phục sự cố
 
 | Hiện tượng | Cách xử lý |
 |---|---|
-| Bot không trả lời | Kiểm tra token/chat id; chạy `python win_monitor.pyw` để xem lỗi |
-| Không chụp được màn hình | Chạy thử PowerShell; đảm bảo có `powershell` trong PATH |
-| `/block` báo không ngắt được | Chạy script bằng quyền **Administrator** |
-| Muốn xem log | Gửi `/logs` trên Telegram, hoặc mở `%APPDATA%\WinMonitor\monitor.log` |
+| Bot không trả lời | Kiểm token/chat id; xem `%APPDATA%\WinMonitor\monitor.log` hoặc `/logs` |
+| Không chụp được màn hình | Thử `/shot`; kiểm tra phiên RDP/lock screen; xem log |
+| `/block` báo không ngắt được | Chạy bằng **Administrator** |
+| Không tự khởi động lại | Kiểm Task Scheduler (`WinMonitorGuard`); có thể bị GPO chặn |
+| 409 Conflict | Token đang dùng ở máy/tiến trình khác — chỉ 1 nơi dùng 1 token |
+| Antivirus báo nhầm | Dùng bản Go native; nếu vẫn bị → xem `tool_build/README.md` |
+| Máy không có mạng | App vẫn chạy, tự gửi bù khi có mạng; bật `heartbeat` để biết còn sống |
 
 ---
 
-## 10. Máy đích CHƯA cài Python → dùng `WinMonitor.exe`
+## 13. Kiểm thử
 
-`win_monitor.pyw` cần Python. Nếu máy đích không có Python, hãy dùng bản **`.exe`
-độc lập** (Python được nhúng sẵn, không cần cài gì).
-
-### Build tự động qua GitHub Actions (không cần máy Windows)
-1. Push lên `main` → tab **Actions → Build Windows EXE** → tải artifact
-   **`WinMonitor-windows-exe`** (chứa `WinMonitor.exe`).
-2. Hoặc tạo tag để tự gắn vào Releases: `git tag v1.0.0 && git push origin v1.0.0`.
-
-### Hoặc build trên máy Windows
-```bat
-pip install -r tool_build/requirements.txt
-python tool_build/build_exe.py
-:: -> dist\WinMonitor.exe
-```
-
-### Triển khai
-1. Chép **`WinMonitor.exe`** sang máy đích (không cần cài Python).
-2. Cấu hình token/chat id: chạy `WinMonitor.exe --token 123:ABC --chat 987654321`,
-   hoặc đặt `winmonitor.config.json` cạnh file `.exe` (xem
-   `winmonitor.config.example.json`), hoặc `WinMonitor.exe --config duong\dan.json`.
-3. Double-click `.exe`. Lần đầu nó tự copy vào `%APPDATA%\WinMonitor\WinMonitor.exe`
-   (ẩn), tạo shortcut ẩn trong Startup, đăng ký Registry + Scheduled Task để tự
-   khởi động & tự phục hồi.
-
-Chi tiết: xem **`tool_build/README.md`**.
-
-### 🛡️ Nếu bị antivirus báo nhầm (false positive)
-File `.exe` (PyInstaller) đôi khi bị AV báo nhầm. Đã cấu hình sẵn để **giảm tối đa**
-(tắt UPX, có manifest + version resource, CI build cả bản `onedir`). Nếu vẫn bị báo:
-1. Dùng bản **`WinMonitor-onedir.zip`** (ít bị báo nhầm nhất — workflow đã build sẵn).
-2. **Ký số** (code signing) — hiệu quả nhất: `build_exe.py --sign ... --pfx ...`,
-   hoặc thêm Secrets `CODE_SIGN_PFX_BASE64` + `CODE_SIGN_PFX_PASSWORD` trong GitHub.
-3. **Gửi false-positive report** cho hãng AV (miễn phí, hết sau 1–3 ngày).
-4. Thêm **exclusion** cho `%APPDATA%\WinMonitor\` trên máy đích (nếu là máy của bạn).
-
-Chi tiết đầy đủ 8 cách: xem **`tool_build/README.md`** mục "Chống báo nhầm Antivirus".
-
----
-
-## 11. ⭐ Bản Go native `WinMonitor.exe` (khuyến nghị — không cần Python, ít bị AV báo nhầm)
-
-Ngoài bản Python, repo còn có **bản viết lại hoàn toàn bằng Go** (`windows-native/`),
-biên dịch thành **1 file `WinMonitor.exe` native**. Đây là cách tốt nhất cho mục tiêu
-"máy đích không cần cài gì + ít bị antivirus báo nhầm".
-
-| | Bản Python | Bản Go native |
-|---|---|---|
-| Máy đích cần Python? | Có (hoặc đóng gói PyInstaller) | **Không** |
-| Antivirus báo nhầm | Cao | **Rất thấp** (PE native, không packer/UPX) |
-| Runtime | Python | Không (static) |
-| Kích thước | nhỏ | ~6 MB |
-
-### Build
 ```bash
-cd windows-native
-./build.sh          # Linux/macOS (cross-compile ra .exe)
-build.bat           # Windows (cần Go)
+# Go
+cd windows-native && go test ./...
+
+# Python
+python -m unittest discover -s tests -v
+
+# Kiểm thử thủ công trên Windows thật: xem docs/QA-checklist.md
 ```
-Hoặc tải từ GitHub Actions (workflow **Build Native Go EXE**) → artifact **`WinMonitor-native`**.
 
-### Triển khai
-1. Chép `WinMonitor.exe` sang máy đích (không cần cài gì).
-2. Cấu hình: `WinMonitor.exe --token ... --chat ...` hoặc đặt `winmonitor.config.json`
-   cạnh file `.exe`.
-3. Double-click → tự copy vào `%APPDATA%\WinMonitor\` (ẩn) + tự khởi động/tự phục hồi.
-4. Telegram → `/start`.
+---
 
-Chi tiết: **`windows-native/README.md`**.
+## 14. Mục đích sử dụng & pháp lý
+
+Công cụ này dành cho việc **giám sát máy tính của CHÍNH BẠN** (hoặc máy bạn có quyền quản
+trị hợp pháp và được sự đồng ý của người dùng). **Không** dùng để theo dõi người khác trái
+phép. Tính năng keylogger có thể ghi cả mật khẩu — chỉ bật khi thật cần. Xem `LICENSE`.
