@@ -1,0 +1,50 @@
+name: Build Native Go EXE
+
+# Build WinMonitor.exe (Go native) - it bi antivirus bao nham, khong can Python.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "windows-native/**"
+      - ".github/workflows/build-go-exe.yml"
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Test
+        working-directory: windows-native
+        run: go test ./...
+
+      - name: Build EXE
+        working-directory: windows-native
+        shell: pwsh
+        run: |
+          $env:GOOS="windows"; $env:GOARCH="amd64"; $env:CGO_ENABLED="0"
+          go build -trimpath -ldflags="-s -w -H windowsgui" -o WinMonitor.exe .
+          Get-Item WinMonitor.exe | Format-List Name,Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinMonitor-native
+          path: windows-native/WinMonitor.exe
+          if-no-files-found: error
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: windows-native/WinMonitor.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

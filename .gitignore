@@ -33,3 +33,7 @@ winmonitor.config.json
 Thumbs.db
 .vscode/
 .idea/
+
+# Go build artifacts (giữ lại WinMonitor.exe đã build sẵn)
+windows-native/winmonitor
+windows-native/*.test

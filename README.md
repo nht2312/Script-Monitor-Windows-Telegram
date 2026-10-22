@@ -14,7 +14,8 @@ Mọi thao tác nguy hiểm đều phải xác nhận bằng **mật khẩu mộ
 | `win_monitor.pyw` | **Script gốc** — toàn bộ code, dùng để đọc/sửa |
 | `win_monitor_mahoa.pyw` | **Bản đã mã hóa** của script gốc — dùng để triển khai (không lộ code/token) |
 | `tool_mahoa/` | Công cụ mã hóa + tài liệu (xem `tool_mahoa/README.md`) |
-| `tool_build/` | Công cụ đóng gói `WinMonitor.exe` (máy đích không cần Python) |
+| `windows-native/` | ⭐ **Bản Go native `WinMonitor.exe`** — máy đích không cần Python, ít bị AV báo nhầm |
+| `tool_build/` | Công cụ đóng gói bản Python thành `.exe` (PyInstaller) |
 | `.github/workflows/` | CI tự build `.exe` trên GitHub Actions |
 | `.gitignore` | Bỏ qua `config.json`, `.env`, log, ảnh chụp... |
 
@@ -255,3 +256,35 @@ File `.exe` (PyInstaller) đôi khi bị AV báo nhầm. Đã cấu hình sẵn 
 4. Thêm **exclusion** cho `%APPDATA%\WinMonitor\` trên máy đích (nếu là máy của bạn).
 
 Chi tiết đầy đủ 8 cách: xem **`tool_build/README.md`** mục "Chống báo nhầm Antivirus".
+
+---
+
+## 11. ⭐ Bản Go native `WinMonitor.exe` (khuyến nghị — không cần Python, ít bị AV báo nhầm)
+
+Ngoài bản Python, repo còn có **bản viết lại hoàn toàn bằng Go** (`windows-native/`),
+biên dịch thành **1 file `WinMonitor.exe` native**. Đây là cách tốt nhất cho mục tiêu
+"máy đích không cần cài gì + ít bị antivirus báo nhầm".
+
+| | Bản Python | Bản Go native |
+|---|---|---|
+| Máy đích cần Python? | Có (hoặc đóng gói PyInstaller) | **Không** |
+| Antivirus báo nhầm | Cao | **Rất thấp** (PE native, không packer/UPX) |
+| Runtime | Python | Không (static) |
+| Kích thước | nhỏ | ~6 MB |
+
+### Build
+```bash
+cd windows-native
+./build.sh          # Linux/macOS (cross-compile ra .exe)
+build.bat           # Windows (cần Go)
+```
+Hoặc tải từ GitHub Actions (workflow **Build Native Go EXE**) → artifact **`WinMonitor-native`**.
+
+### Triển khai
+1. Chép `WinMonitor.exe` sang máy đích (không cần cài gì).
+2. Cấu hình: `WinMonitor.exe --token ... --chat ...` hoặc đặt `winmonitor.config.json`
+   cạnh file `.exe`.
+3. Double-click → tự copy vào `%APPDATA%\WinMonitor\` (ẩn) + tự khởi động/tự phục hồi.
+4. Telegram → `/start`.
+
+Chi tiết: **`windows-native/README.md`**.
