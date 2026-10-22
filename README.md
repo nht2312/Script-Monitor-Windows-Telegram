@@ -7,6 +7,15 @@ Mọi thao tác nguy hiểm đều phải xác nhận bằng **mật khẩu mộ
 
 > Chỉ cần **Python 3** cho Windows. Không cần cài thêm thư viện nào.
 
+## Các file trong repo
+
+| File | Mô tả |
+|---|---|
+| `win_monitor.pyw` | **Script gốc** — toàn bộ code, dùng để đọc/sửa |
+| `win_monitor_mahoa.pyw` | **Bản đã mã hóa** của script gốc — dùng để triển khai (không lộ code/token) |
+| `tool_mahoa/` | Công cụ mã hóa + tài liệu (xem `tool_mahoa/README.md`) |
+| `.gitignore` | Bỏ qua `config.json`, `.env`, log, ảnh chụp... |
+
 ---
 
 ## 1. Cài đặt (làm 1 lần)
@@ -37,8 +46,8 @@ DEFAULT_CHAT_ID   = "123456789"      # chat id cua ban
 ### 1.4. Chạy
 - **Double-click** `win_monitor.pyw` (đuôi `.pyw` nên không hiện cửa sổ đen).
 - Lần đầu chạy, script sẽ:
-  - Tự copy vào `%APPDATA%\WinMonitor\monitor.pyw`
-  - Tự copy vào thư mục **Startup**
+  - Tự copy vào `%APPDATA%\WinMonitor\.win_monitor.pyw` (file **ẩn**)
+  - Tự copy vào thư mục **Startup** dưới dạng file **ẩn** (`.win_monitor.pyw`)
   - Đăng ký **Registry Run** + **2 Scheduled Task** (để tự phục hồi nếu bị tắt)
 - Mở Telegram, nhắn **`/start`** cho bot để bắt đầu.
 
@@ -134,7 +143,42 @@ ngay, không cần khởi động lại.
 
 ---
 
-## 6. Gỡ cài đặt hoàn toàn
+## 6. Ẩn file & mã hóa script (nâng cao)
+
+### 6.1. Tự động ẩn file
+Khi chạy, script tự đặt thuộc tính **Hidden + System** cho:
+- Chính file đang chạy
+- Bản sao `%APPDATA%\WinMonitor\.win_monitor.pyw`
+- Bản sao trong Startup: `.win_monitor.pyw`
+
+Nhờ tên bắt đầu bằng dấu chấm (`.`) và thuộc tính ẩn, file gần như vô hình trong
+File Explorer và giống kiểu file cấu hình `.env`.
+
+> Để xem lại file ẩn: trong File Explorer bật *View → Show → Hidden items*, hoặc chạy
+> `attrib -h -s "%APPDATA%\WinMonitor\.win_monitor.pyw"` trong CMD.
+
+### 6.2. Mã hóa script thành `win_monitor_mahoa.pyw`
+Dùng công cụ trong `tool_mahoa/` để tạo bản mã hóa (mở Notepad không thấy code/token,
+nhưng vẫn chạy y như file gốc):
+
+```bash
+python tool_mahoa/ma_hoa.py win_monitor.pyw -p "MatKhauCuaBan"
+# -> tạo win_monitor_mahoa.pyw (đã mã hóa)
+```
+
+Vì file chạy nền từ Startup không có console để hỏi mật khẩu, hãy đặt mật khẩu trong
+file `.env` cạnh script (xem `tool_mahoa/.env.example`):
+
+```
+WINMON_KEY=MatKhauCuaBan
+```
+
+Chi tiết đầy đủ + 2 chế độ (`source`/`compiled`) + cảnh báo bảo mật: xem
+**`tool_mahoa/README.md`**.
+
+---
+
+## 7. Gỡ cài đặt hoàn toàn
 
 1. Gửi `/stop` trên Telegram → nhập `/confirm <mã>` → script tự gỡ khỏi Startup,
    Registry và Scheduled Task rồi thoát.
@@ -142,15 +186,16 @@ ngay, không cần khởi động lại.
 
 ---
 
-## 7. Bảo mật
+## 8. Bảo mật
 
 - **Token** nằm trong file → nên đặt quyền file chỉ user hiện tại đọc được.
 - Chỉ **Chat ID** đã cấu hình mới điều khiển được bot.
 - OTP hiển thị **chỉ trên Telegram của chủ máy** → kẻ khác không tắt được máy.
+- Dùng bản mã hóa `win_monitor_mahoa.pyw` để không lộ code/token khi mở file.
 
 ---
 
-## 8. Khắc phục sự cố
+## 9. Khắc phục sự cố
 
 | Hiện tượng | Cách xử lý |
 |---|---|

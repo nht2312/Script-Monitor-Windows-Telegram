@@ -11,6 +11,13 @@ config.json
 shot_*.png
 _shot.ps1
 
+# Mật khẩu giải mã file mã hóa - KHÔNG commit
+.env
+*.env
+!.env.example
+win_monitor.env
+.win_monitor.env
+
 # OS / editor
 .DS_Store
 Thumbs.db

