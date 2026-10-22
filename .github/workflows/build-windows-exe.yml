@@ -1,0 +1,48 @@
+name: Build Windows EXE
+
+# Tự động build WinMonitor.exe trên máy Windows của GitHub (không cần máy Windows thật).
+# Chạy khi: push lên main, tạo tag, hoặc bấm tay trong tab Actions.
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tool_build/requirements.txt
+
+      - name: Build EXE
+        run: python tool_build/build_exe.py
+
+      - name: Show result
+        run: dir dist
+
+      - name: Upload artifact (WinMonitor.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinMonitor-windows-exe
+          path: dist/WinMonitor.exe
+          if-no-files-found: error
+
+      # Nếu push tag (vd v1.0.0) thì tự gắn .exe vào Release
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/WinMonitor.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

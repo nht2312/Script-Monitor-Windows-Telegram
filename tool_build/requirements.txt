@@ -1,0 +1,2 @@
+# Thư viện cần để BUILD file .exe (không cần cài trên máy đích)
+pyinstaller>=6.0

@@ -18,6 +18,16 @@ _shot.ps1
 win_monitor.env
 .win_monitor.env
 
+# Build .exe
+build/
+dist/
+*.spec
+tool_build/build/
+tool_build/_build_entry.py
+
+# Cấu hình đóng gói sẵn (chứa token) - KHÔNG commit
+winmonitor.config.json
+
 # OS / editor
 .DS_Store
 Thumbs.db

