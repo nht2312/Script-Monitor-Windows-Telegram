@@ -7,17 +7,22 @@ package main
 
 var AutoUnblockNotify func()
 
-func hideConsole()                     {}
-func foregroundTitle() string          { return "" }
-func takeScreenshot(path string) bool  { return false }
-func lockWorkstation() bool            { return false }
-func keyDown(vk int) bool              { return false }
-func hideFile(path string)             {}
-func moveFileOnReboot(path string)     {}
-func acquireSingleInstance() bool      { return true }
-func isInputBlocked() bool             { return false }
-func StartBlock(auto int) (bool, bool) { return false, false }
-func StopBlock() bool                  { return false }
+func hideConsole()                             {}
+func setDpiAwareness()                         {}
+func isRemoteSession() bool                    { return false }
+func isElevated() bool                         { return false }
+func foregroundTitle() string                  { return "" }
+func takeScreenshot(path string) bool          { return false }
+func lockWorkstation() bool                    { return false }
+func keyDown(vk int) bool                      { return false }
+func hideFile(path string)                     {}
+func restrictToCurrentUser(path string)        {}
+func moveFileOnReboot(path string)             {}
+func acquireSingleInstance() bool              { return true }
+func isInputBlocked() bool                     { return false }
+func StartBlock(auto int) (bool, bool)         { return false, false }
+func StopBlock() bool                          { return false }
+func startKeyboardHook(sink func(string)) bool { return false }
 
 type Proc struct {
 	PID  string
