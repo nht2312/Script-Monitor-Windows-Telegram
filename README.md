@@ -60,6 +60,11 @@ lần khởi động sau vẫn tự chạy nền.
 
 ## 2. Danh sách lệnh Telegram
 
+> 💡 **Menu lệnh tự cập nhật:** mỗi khi script khởi động, nó **tự động đẩy danh sách
+> lệnh lên Telegram** (nút menu ☰ trong khung chat). Bạn không cần nhập tay. Muốn
+> cập nhật lại bất cứ lúc nào, gửi `/reload`. Việc này chạy nền nên **không làm gián
+> đoạn** việc sử dụng ở cả hai phía.
+
 ### Giám sát
 | Lệnh | Tác dụng |
 |---|---|
@@ -94,6 +99,7 @@ lần khởi động sau vẫn tự chạy nền.
 | `/config` | Xem cấu hình |
 | `/set <khóa> <giá trị>` | Đổi cấu hình trực tiếp |
 | `/logs [n]` | Xem log gần đây |
+| `/reload` | Cập nhật lại menu lệnh trên Telegram |
 
 ---
 

