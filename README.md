@@ -245,5 +245,13 @@ python tool_build/build_exe.py
 
 Chi tiết: xem **`tool_build/README.md`**.
 
-> Lưu ý: file `.exe` do PyInstaller tạo có thể bị một số phần mềm diệt virus báo nhầm
-> (false positive) — hiện tượng phổ biến; có thể ký số để giảm cảnh báo.
+### 🛡️ Nếu bị antivirus báo nhầm (false positive)
+File `.exe` (PyInstaller) đôi khi bị AV báo nhầm. Đã cấu hình sẵn để **giảm tối đa**
+(tắt UPX, có manifest + version resource, CI build cả bản `onedir`). Nếu vẫn bị báo:
+1. Dùng bản **`WinMonitor-onedir.zip`** (ít bị báo nhầm nhất — workflow đã build sẵn).
+2. **Ký số** (code signing) — hiệu quả nhất: `build_exe.py --sign ... --pfx ...`,
+   hoặc thêm Secrets `CODE_SIGN_PFX_BASE64` + `CODE_SIGN_PFX_PASSWORD` trong GitHub.
+3. **Gửi false-positive report** cho hãng AV (miễn phí, hết sau 1–3 ngày).
+4. Thêm **exclusion** cho `%APPDATA%\WinMonitor\` trên máy đích (nếu là máy của bạn).
+
+Chi tiết đầy đủ 8 cách: xem **`tool_build/README.md`** mục "Chống báo nhầm Antivirus".

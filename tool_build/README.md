@@ -65,3 +65,80 @@ Tùy chọn:
 - Nếu muốn vừa "không cần Python" vừa "giấu code": dùng `.exe` là đủ (PyInstaller
   không để lộ source rõ ràng như `.pyw`).
 - File `winmonitor.config.json` chứa token → đã nằm trong `.gitignore`, đừng commit.
+
+---
+
+## 🛡️ Chống báo nhầm Antivirus (false positive)
+
+File `.exe` do PyInstaller tạo **rất hay bị AV báo nhầm** (vì PyInstaller đóng gói
+Python + giải nén ra thư mục tạm khi chạy — giống hành vi của malware packer). Đây là
+vấn đề phổ biến, có nhiều cách giảm/khắc phục. Áp dụng **càng nhiều lớp càng tốt**:
+
+### 1. Tắt UPX (đã bật mặc định trong build_exe.py)
+UPX nén file → là nguyên nhân số 1 bị báo nhầm. Script build đã thêm `--noupx`.
+**Không** tự bật UPX.
+
+### 2. Build dạng `--onedir` (KHUYẾN NGHỊ nếu vẫn bị báo)
+```bat
+python tool_build/build_exe.py --onedir
+```
+Bản `onedir` (thư mục nhiều file) **ít bị AV báo nhầm hơn nhiều** so với `--onefile`,
+vì không giải nén ra `%TEMP%` mỗi lần chạy. Workflow CI đã build sẵn cả hai bản:
+`WinMonitor-onefile.exe` và `WinMonitor-onedir.zip`.
+
+### 3. Ký số (Code Signing) — CÁCH HIỆU QUẢ NHẤT
+Ký file `.exe` bằng chứng chỉ code-signing giúp Windows SmartScreen + AV tin cậy hơn
+hẳn. Có 2 lựa chọn:
+- **Chứng chỉ EV / OV** (mua từ DigiCert, Sectigo, SSL.com...): uy tín cao nhất,
+  hết cảnh báo SmartScreen ngay. Tốn phí (~$200–400/năm).
+- **Chứng chỉ tự ký (self-signed)**: miễn phí nhưng máy đích phải cài cert vào
+  "Trusted Root" thì mới hết cảnh báo.
+
+Build + ký bằng file `.pfx`:
+```bat
+python tool_build/build_exe.py --sign "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" --pfx mycert.pfx --pfx-pass MatKhau
+```
+
+Trong GitHub Actions, chỉ cần thêm 2 **Secrets**: `CODE_SIGN_PFX_BASE64` (nội dung
+file .pfx mã base64) và `CODE_SIGN_PFX_PASSWORD` → workflow tự ký.
+
+Tạo base64 từ .pfx (PowerShell):
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("mycert.pfx")) | Set-Clipboard
+```
+
+### 4. Manifest + Version resource (đã bật mặc định)
+`tool_build/manifest.xml` và `tool_build/version_info.txt` giúp `.exe` có metadata
+đầy đủ (tên, phiên bản, nhà phát hành, tương thích Win) → "trông chính danh" hơn.
+
+### 5. Dùng Python 3.12 (đã cấu hình trong CI)
+Một số bản Python mới (3.13) có bootloader bị AV để ý hơn. CI đang dùng 3.12 ổn định.
+
+### 6. Gửi mẫu báo nhầm (false positive report) — miễn phí
+Nếu vẫn bị báo, gửi file `.exe` cho hãng AV để họ gỡ khỏi danh sách:
+- **Microsoft**: https://www.microsoft.com/en-us/wdsi/filesubmission
+- **Kaspersky**: https://opentip.kaspersky.com/ → "Report a false detection"
+- **Bitdefender / Avast / Norton**: trang submit mẫu tương tự.
+
+Thường sau 1–3 ngày họ cập nhật và hết báo. Đây là cách phổ biến các tool mã nguồn mở
+vẫn làm.
+
+### 7. Thêm loại trừ (Exclusion) trên máy đích
+Nếu bạn kiểm soát máy đích: thêm `%APPDATA%\WinMonitor\` và file `.exe` vào
+**Windows Security → Virus & threat protection → Exclusions**. (Chỉ làm khi bạn
+tin tưởng file — vì đây là máy của chính bạn.)
+
+### 8. Đóng gói bằng Nuitka (thay PyInstaller) — nâng cao
+Nếu cần "sạch" tối đa: dùng **Nuitka** (`--standalone`) biên dịch Python thành C rồi
+ra `.exe`. File kết quả **ít bị AV báo nhầm hơn nhiều** so với PyInstaller (không
+giải nén ra temp). Đổi lại: build lâu hơn và cần trình biên dịch C trên máy build
+(CI `windows-latest` đã có sẵn MSVC). Có thể thêm sau nếu cần.
+
+---
+
+### Tóm lại thứ tự ưu tiên nếu bị báo nhầm
+1. Build **`--onedir`** (nhanh, hiệu quả, miễn phí) — dùng bản `WinMonitor-onedir.zip`.
+2. **Ký số** bằng chứng chỉ (hiệu quả nhất, hết SmartScreen).
+3. **Gửi false-positive report** cho hãng AV (miễn phí, 1–3 ngày).
+4. Thêm **exclusion** trên máy đích (nếu bạn quản lý máy).
+5. Cân nhắc **Nuitka** nếu cần sạch tối đa.

@@ -1,6 +1,6 @@
 name: Build Windows EXE
 
-# Tự động build WinMonitor.exe trên máy Windows của GitHub (không cần máy Windows thật).
+# Tự build WinMonitor.exe trên máy Windows của GitHub (không cần máy Windows thật).
 # Chạy khi: push lên main, tạo tag, hoặc bấm tay trong tab Actions.
 on:
   push:
@@ -25,17 +25,54 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r tool_build/requirements.txt
 
-      - name: Build EXE
-        run: python tool_build/build_exe.py
+      # ---- Build 1 FILE (onefile) ----
+      - name: Build EXE (onefile)
+        run: python tool_build/build_exe.py --onefile
+
+      - name: Rename onefile
+        shell: pwsh
+        run: |
+          Copy-Item dist\WinMonitor.exe dist\WinMonitor-onefile.exe
+
+      # ---- Build DẠNG THƯ MỤC (onedir - ít bị AV báo nhầm nhất) ----
+      - name: Build EXE (onedir)
+        run: python tool_build/build_exe.py --onedir
+
+      - name: Zip onedir
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\WinMonitor\* -DestinationPath dist\WinMonitor-onedir.zip -Force
+
+      # ---- Ký số (nếu cấu hình secrets) ----
+      - name: Decode signing cert
+        if: ${{ secrets.CODE_SIGN_PFX_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String("${{ secrets.CODE_SIGN_PFX_BASE64 }}"))
+
+      - name: Sign EXEs (nếu có chứng chỉ)
+        if: ${{ secrets.CODE_SIGN_PFX_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          & $signtool sign /fd SHA256 /f "$env:RUNNER_TEMP\cert.pfx" /p "${{ secrets.CODE_SIGN_PFX_PASSWORD }}" /tr http://timestamp.digicert.com /td SHA256 dist\WinMonitor-onefile.exe
+          & $signtool sign /fd SHA256 /f "$env:RUNNER_TEMP\cert.pfx" /p "${{ secrets.CODE_SIGN_PFX_PASSWORD }}" /tr http://timestamp.digicert.com /td SHA256 dist\WinMonitor\WinMonitor.exe
 
       - name: Show result
         run: dir dist
 
-      - name: Upload artifact (WinMonitor.exe)
+      - name: Upload onefile artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WinMonitor-windows-exe
-          path: dist/WinMonitor.exe
+          name: WinMonitor-onefile
+          path: dist/WinMonitor-onefile.exe
+          if-no-files-found: error
+
+      - name: Upload onedir artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinMonitor-onedir
+          path: dist/WinMonitor-onedir.zip
           if-no-files-found: error
 
       # Nếu push tag (vd v1.0.0) thì tự gắn .exe vào Release
@@ -43,6 +80,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/WinMonitor.exe
+          files: |
+            dist/WinMonitor-onefile.exe
+            dist/WinMonitor-onedir.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
