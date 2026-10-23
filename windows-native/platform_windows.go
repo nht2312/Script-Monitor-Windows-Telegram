@@ -8,6 +8,7 @@ import (
 	"image/png"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -208,6 +209,22 @@ func acquireSingleInstance() bool {
 		return false
 	}
 	return true
+}
+
+func releaseSingleInstance() {
+	if mutexHandle != 0 {
+		syscall.CloseHandle(syscall.Handle(mutexHandle))
+		mutexHandle = 0
+	}
+}
+
+// relaunchCanonical chạy bản chuẩn trong %APPDATA% (tách rời, ẩn cửa sổ).
+func relaunchCanonical(args []string) error {
+	cmd := exec.Command(deployExe, args...)
+	cmd.Dir = filepath.Dir(deployExe)
+	// DETACHED_PROCESS(0x8) | CREATE_NO_WINDOW(0x08000000)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x00000008 | 0x08000000}
+	return cmd.Start()
 }
 
 // ---- BlockInput (giữ trên 1 OS thread + luôn giải phóng) ----

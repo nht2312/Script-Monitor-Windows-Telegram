@@ -36,3 +36,6 @@ func restartMachine() bool                                        { return false
 func createShortcut(l, t, a, w string) bool                       { return false }
 func runHidden(name string, args ...string) error                 { return nil }
 func runHiddenOutput(name string, args ...string) (string, error) { return "", nil }
+
+func releaseSingleInstance()                {}
+func relaunchCanonical(args []string) error { return nil }
