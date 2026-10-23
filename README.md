@@ -237,16 +237,19 @@ Van an toàn 30 phút đảm bảo **không bao giờ khóa cứng** máy kể c
 
 ### 6.1. Cách A — Go native (khuyến nghị, không cần Python)
 1. Tải `WinMonitor.exe` (trong `windows-native/` hoặc Releases).
-2. Cấu hình (chọn 1):
-   - `WinMonitor.exe --token 123:ABC --chat 987654321`
-   - hoặc đặt `winmonitor.config.json` cạnh `.exe` (xem file `.example`).
-3. Double-click `.exe` → tự cài khởi động ẩn + tự phục hồi.
+2. **Double-click `.exe`** → hiện **cửa sổ terminal hỏi cấu hình** (bot token, chat id,
+   chu kỳ chụp, bật/tắt các monitor…). Nhấn Enter để giữ giá trị mặc định.
+   - Hoặc chạy có tham số: `WinMonitor.exe --token 123:ABC --chat 987654321`
+   - Hoặc đặt `winmonitor.config.json` cạnh `.exe` (xem file `.example`).
+3. Sau khi lưu, app tự cài khởi động ẩn + tự phục hồi (các lần tự khởi động dùng
+   `--silent` nên **không** hiện wizard).
 4. Telegram → `/start`.
 
 ### 6.2. Cách B — Python
 1. Cài Python 3 (tích "Add to PATH").
 2. Tạo bot: **@BotFather** → `/newbot` → lấy token; lấy chat id qua **@userinfobot**.
-3. `pythonw win_monitor.pyw --token ... --chat ...` (hoặc sửa `DEFAULT_BOT_TOKEN`/`DEFAULT_CHAT_ID`).
+3. Double-click `win_monitor.pyw` (hoặc `python win_monitor.pyw`) → **wizard hỏi cấu hình**
+   trên terminal. (Hoặc `--token ... --chat ...` / sửa `DEFAULT_BOT_TOKEN`/`DEFAULT_CHAT_ID`.)
 4. Telegram → `/start`.
 
 ### 6.3. Chạy quyền Administrator (khuyến nghị)
@@ -281,9 +284,12 @@ hưởng gì: app vẫn chạy từ `%APPDATA%`, cấu hình vẫn còn trong
    (Nếu bản cũ còn chạy, single-instance sẽ chặn; hãy End task bản cũ trước.)
 3. Cấu hình (`config.json`) **giữ nguyên** qua các lần cập nhật.
 
-### Đổi cấu hình — 3 cách (không cần cài lại)
-- **Telegram** (tiện nhất): `/config` xem, `/set <khóa> <giá trị>`, `/interval`, `/screen on/off`… → **áp dụng ngay**.
-- **File**: sửa `%APPDATA%\WinMonitor\config.json` rồi gửi `/reload_config`.
+### Đổi cấu hình — 4 cách (không cần cài lại)
+- **Chạy lại file `.exe`** → hiện **wizard** hỏi lại toàn bộ cấu hình. Lưu xong app **tự nạp
+  lại ngay** (không cần restart) nhờ cơ chế theo dõi `config.json`. Đây là cách bạn yêu cầu.
+- **Telegram**: `/config` xem, `/set <khóa> <giá trị>`, `/interval`, `/screen on/off`… → **áp dụng ngay**.
+  Có thể gửi `/edit` để **mở wizard trên máy** từ xa.
+- **File**: sửa `%APPDATA%\WinMonitor\config.json` → **tự nạp lại** (hoặc `/reload_config`).
 - **Bootstrap**: đặt `winmonitor.config.json` cạnh `.exe` trước lần chạy đầu (tự nạp rồi xóa).
 
 ### Gỡ chương trình hoàn toàn — làm gì?
@@ -295,6 +301,22 @@ Sau đó xóa nốt thư mục `%APPDATA%\WinMonitor\` nếu muốn (chứa log/
 > Gỡ thủ công (nếu không dùng được Telegram): xóa Task `WinMonitorGuard`/`WinMonitorLogon`
 > trong Task Scheduler, xóa giá trị `WinMonitor` trong `HKCU\...\Run`, xóa shortcut
 > `WinMonitor.lnk` trong Startup, xóa thư mục `%APPDATA%\WinMonitor\`.
+
+---
+
+### 6.4. Tham số dòng lệnh (CLI flags)
+| Tham số | Ý nghĩa |
+|---|---|
+| *(không có)* | Double-click → **hiện wizard** hỏi cấu hình |
+| `--setup` | Buộc mở wizard (dùng để sửa cấu hình) |
+| `--silent` | Chạy nền, **không** hiện wizard (dùng cho tự khởi động) |
+| `--no-wizard` | Giống `--silent` (bỏ qua wizard) |
+| `--token <token>` | Đặt bot token |
+| `--chat <id>` | Đặt chat id |
+| `--config <file>` | Nạp cấu hình từ file JSON |
+
+> Các lối tự khởi động (Registry Run, Scheduled Task, Startup shortcut) **luôn** thêm
+> `--silent` → không bao giờ hiện wizard khi khởi động máy.
 
 ---
 
@@ -334,6 +356,7 @@ Sau đó xóa nốt thư mục `%APPDATA%\WinMonitor\` nếu muốn (chứa log/
 | Lệnh | Tác dụng |
 |---|---|
 | `/config` | Xem toàn bộ (token bị ẩn) |
+| `/edit` | Mở cửa sổ wizard sửa cấu hình trên máy (từ xa) |
 | `/get <khóa>` | Xem 1 khóa |
 | `/set <khóa> <giá trị>` | Đổi (tự validate/clamp) |
 | `/reset` | Về mặc định (giữ token/chat_id) |
