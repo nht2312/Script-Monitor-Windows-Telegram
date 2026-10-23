@@ -46,6 +46,10 @@ var (
 	procSetProcessDpiAwarenessCtx = user32.NewProc("SetProcessDpiAwarenessContext")
 	procSetProcessDPIAware        = user32.NewProc("SetProcessDPIAware")
 	procSetWindowsHookEx          = user32.NewProc("SetWindowsHookExW")
+	procAllocConsole              = kernel32.NewProc("AllocConsole")
+	procFreeConsole               = kernel32.NewProc("FreeConsole")
+	procSetConsoleOutputCP        = kernel32.NewProc("SetConsoleOutputCP")
+	procSetConsoleCP              = kernel32.NewProc("SetConsoleCP")
 	procCallNextHookEx            = user32.NewProc("CallNextHookEx")
 	procUnhookWindowsHookEx       = user32.NewProc("UnhookWindowsHookEx")
 	procGetMessage                = user32.NewProc("GetMessageW")
@@ -55,6 +59,25 @@ var (
 
 // AutoUnblockNotify được main gán để báo khi bàn phím/chuột tự mở khóa.
 var AutoUnblockNotify func()
+
+// allocConsole tạo cửa sổ console cho wizard cấu hình (app là GUI-subsystem nên
+// mặc định không có console). Sau khi tạo, gắn lại stdin/stdout/stderr vào console.
+func allocConsole() {
+	procAllocConsole.Call()
+	procSetConsoleOutputCP.Call(65001) // UTF-8 để hiển thị tiếng Việt
+	procSetConsoleCP.Call(65001)
+	if f, err := os.OpenFile("CONOUT$", os.O_RDWR, 0); err == nil {
+		os.Stdout = f
+		os.Stderr = f
+	}
+	if f, err := os.OpenFile("CONIN$", os.O_RDWR, 0); err == nil {
+		os.Stdin = f
+	}
+}
+
+func freeConsole() {
+	procFreeConsole.Call()
+}
 
 func hideConsole() {
 	hwnd, _, _ := procGetConsoleWindow.Call()

@@ -39,3 +39,6 @@ func runHiddenOutput(name string, args ...string) (string, error) { return "", n
 
 func releaseSingleInstance()                {}
 func relaunchCanonical(args []string) error { return nil }
+
+func allocConsole() {}
+func freeConsole()  {}

