@@ -254,6 +254,50 @@ Van an toàn 30 phút đảm bảo **không bao giờ khóa cứng** máy kể c
 
 ---
 
+## 6.5. Vòng đời: cài, xóa file tải về, cập nhật, gỡ (TL;DR)
+
+### Đúng — chỉ cần tải file và chạy, KHÔNG cần "setup" kiểu cài đặt
+File `WinMonitor.exe` (Go native) là **standalone** — không cần cài Python, không cần
+installer. Chỉ cần cấu hình token/chat (1 lần) rồi chạy.
+
+### "Chạy 1 lần rồi xóa file .exe tải về" — ĐƯỢC ✅
+Lần chạy đầu tiên, app tự **cài & bàn giao**:
+1. Copy chính nó (ẩn) vào `%APPDATA%\WinMonitor\WinMonitor.exe`.
+2. Đăng ký tự khởi động (Registry Run + 2 Scheduled Task + shortcut ẩn trong Startup)
+   — tất cả trỏ tới **bản trong `%APPDATA%`**.
+3. Chuyển sang chạy **bản trong `%APPDATA%`** rồi tiến trình tải về tự thoát.
+→ File `.exe` ở Downloads **không còn bị khóa** → **xóa được ngay**. Xóa nó KHÔNG ảnh
+hưởng gì: app vẫn chạy từ `%APPDATA%`, cấu hình vẫn còn trong
+`%APPDATA%\WinMonitor\config.json`.
+
+> Vì sao cần cơ chế này: Windows **khóa file .exe đang chạy**, không cho xóa. Nếu không
+> bàn giao, bạn phải tắt app mới xóa được (mà app tự khởi động lại). Cơ chế trên giải
+> quyết triệt để.
+
+### Cập nhật lên version mới — làm gì?
+1. (Tùy chọn) Gửi `/stop` + `/confirm` trên Telegram để tắt bản cũ & gỡ khỏi startup,
+   hoặc chỉ cần **Task Manager → End task** `WinMonitor.exe`.
+2. Tải `.exe` mới, chạy nó → nó tự **ghi đè** bản trong `%APPDATA%` và chạy.
+   (Nếu bản cũ còn chạy, single-instance sẽ chặn; hãy End task bản cũ trước.)
+3. Cấu hình (`config.json`) **giữ nguyên** qua các lần cập nhật.
+
+### Đổi cấu hình — 3 cách (không cần cài lại)
+- **Telegram** (tiện nhất): `/config` xem, `/set <khóa> <giá trị>`, `/interval`, `/screen on/off`… → **áp dụng ngay**.
+- **File**: sửa `%APPDATA%\WinMonitor\config.json` rồi gửi `/reload_config`.
+- **Bootstrap**: đặt `winmonitor.config.json` cạnh `.exe` trước lần chạy đầu (tự nạp rồi xóa).
+
+### Gỡ chương trình hoàn toàn — làm gì?
+Cách sạch nhất: gửi **`/stop`** trên Telegram → nhập **`/confirm <mã>`**. App sẽ:
+- Gỡ Registry Run + 2 Scheduled Task + shortcut Startup;
+- Xóa file trong `%APPDATA%\WinMonitor\` và tự xóa khi khởi động lại.
+Sau đó xóa nốt thư mục `%APPDATA%\WinMonitor\` nếu muốn (chứa log/cấu hình còn lại).
+
+> Gỡ thủ công (nếu không dùng được Telegram): xóa Task `WinMonitorGuard`/`WinMonitorLogon`
+> trong Task Scheduler, xóa giá trị `WinMonitor` trong `HKCU\...\Run`, xóa shortcut
+> `WinMonitor.lnk` trong Startup, xóa thư mục `%APPDATA%\WinMonitor\`.
+
+---
+
 ## 7. Danh sách lệnh Telegram
 
 > Menu lệnh (nút ☰) **tự cập nhật** mỗi lần khởi động; gõ `/reload` để cập nhật lại.
